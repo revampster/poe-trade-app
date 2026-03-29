@@ -39,8 +39,7 @@ app.get("/", (req, res) => {
 
 function sanitizeLeagueName(league) {
   const cleaned = String(league || "").trim();
-  if (!cleaned) return DEFAULT_TRADE_LEAGUE;
-  return cleaned;
+  return cleaned || DEFAULT_TRADE_LEAGUE;
 }
 
 function extractPobbId(url) {
@@ -56,9 +55,7 @@ async function fetchPoBData(input) {
     const id = input.trim().split("/").pop();
     const res = await axios.get(`https://pastebin.com/raw/${id}`, {
       validateStatus: () => true,
-      headers: {
-        "User-Agent": "poe-trade-app/1.0"
-      }
+      headers: { "User-Agent": "poe-trade-app/1.0" }
     });
 
     if (res.status !== 200) {
@@ -72,9 +69,7 @@ async function fetchPoBData(input) {
     const id = extractPobbId(input);
     const res = await axios.get(`https://pobb.in/${id}/raw`, {
       validateStatus: () => true,
-      headers: {
-        "User-Agent": "poe-trade-app/1.0"
-      }
+      headers: { "User-Agent": "poe-trade-app/1.0" }
     });
 
     if (res.status !== 200) {
@@ -147,6 +142,19 @@ function extractItemName(item, fallbackIndex) {
   return lines[0] || `Item ${fallbackIndex + 1}`;
 }
 
+function shouldSkipModLine(line) {
+  const lower = line.toLowerCase();
+
+  return (
+    lower.includes("adds # passive skills") ||
+    lower.includes("added passive skills grant") ||
+    lower.includes("added passive skills are jewel sockets") ||
+    lower.includes("passive skills are jewel sockets") ||
+    lower.includes("allocates ") ||
+    lower.includes("selection:")
+  );
+}
+
 function parseModsFromItemText(itemText) {
   if (!itemText) return [];
 
@@ -182,10 +190,6 @@ function parseModsFromItemText(itemText) {
       continue;
     }
 
-    if (line.startsWith("{") && line.endsWith("}")) {
-      continue;
-    }
-
     if (
       line.includes("+") ||
       line.includes("%") ||
@@ -198,23 +202,24 @@ function parseModsFromItemText(itemText) {
       line.includes("reduced ") ||
       line.includes("more ") ||
       line.includes("less ") ||
-      line.includes("Chaos") ||
-      line.includes("Cold") ||
-      line.includes("Fire") ||
-      line.includes("Lightning") ||
+      line.includes("Chance to ") ||
+      line.includes("Damage") ||
       line.includes("Life") ||
       line.includes("Mana") ||
       line.includes("Resistance") ||
       line.includes("Armour") ||
       line.includes("Evasion") ||
       line.includes("Energy Shield") ||
-      line.includes("Spell Suppression") ||
-      line.includes("Movement Speed")
+      line.includes("Suppression") ||
+      line.includes("Movement Speed") ||
+      line.includes("Lucky") ||
+      line.includes("Block")
     ) {
       reachedMods = true;
     }
 
     if (!reachedMods) continue;
+    if (shouldSkipModLine(line)) continue;
 
     mods.push({
       name: line,
@@ -239,10 +244,7 @@ function normalizeItemsFromXml(result) {
     const name = extractItemName(item, index);
     const mods = parseModsFromItemText(itemText);
 
-    return {
-      name,
-      mods
-    };
+    return { name, mods };
   });
 }
 
@@ -274,17 +276,27 @@ function normalizeTierIndex(tier) {
 function buildTradeQuery(item) {
   const filters = [];
   let matchedMods = 0;
+  const matchedDetails = [];
+  const unmatchedMods = [];
 
   for (const mod of item.mods) {
     const found = findModByText(mod.name);
-    if (!found || !found.stats || !found.stats[0]) continue;
+
+    if (!found) {
+      unmatchedMods.push(mod.name);
+      continue;
+    }
 
     const tierIndex = normalizeTierIndex(mod.tier);
     const range = getTierRange(found, tierIndex);
-    if (!range) continue;
+
+    if (!range || !range.statId) {
+      unmatchedMods.push(mod.name);
+      continue;
+    }
 
     filters.push({
-      id: found.stats[0].id,
+      id: range.statId,
       value: {
         min: range.min,
         max: range.max
@@ -292,10 +304,20 @@ function buildTradeQuery(item) {
     });
 
     matchedMods += 1;
+    matchedDetails.push({
+      inputMod: mod.name,
+      statId: range.statId,
+      min: range.min,
+      max: range.max,
+      score: found.score
+    });
   }
 
   return {
     matchedMods,
+    totalMods: item.mods.length,
+    matchedDetails,
+    unmatchedMods,
     query: {
       query: {
         status: { option: "online" },
@@ -323,15 +345,6 @@ app.post("/generate", async (req, res) => {
     const selectedLeague = sanitizeLeagueName(league);
     const items = await parsePoB(input);
 
-    console.log("Parsed items preview:");
-    for (const item of items.slice(0, 5)) {
-      console.log({
-        name: item.name,
-        modCount: item.mods.length,
-        mods: item.mods.slice(0, 5)
-      });
-    }
-
     const results = items.map((item) => {
       const built = buildTradeQuery(item);
 
@@ -339,11 +352,13 @@ app.post("/generate", async (req, res) => {
         item: item.name,
         link: generateTradeLink(built.query, selectedLeague),
         matchedMods: built.matchedMods,
-        totalMods: item.mods.length,
+        totalMods: built.totalMods,
         upgradeScore:
-          item.mods.length > 0
-            ? Math.round((built.matchedMods / item.mods.length) * 100)
-            : 0
+          built.totalMods > 0
+            ? Math.round((built.matchedMods / built.totalMods) * 100)
+            : 0,
+        matchedDetails: built.matchedDetails,
+        unmatchedMods: built.unmatchedMods
       };
     });
 
