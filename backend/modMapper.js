@@ -213,7 +213,7 @@ function findBestTradeStat(text) {
   }
 
   if (!best) return null;
-  if (best.score < 0.6) return null;
+  if (best.score < 0.65) return null;
   if (!isValidTradeStatId(best.id)) return null;
 
   return best;
@@ -232,51 +232,46 @@ function dedupeMatches(matches) {
   return out;
 }
 
-function selectBestFilters(matches) {
-  const caps = {
-    total: 3,
-    explicit: 2,
-    implicit: 1,
-    enchant: 1
-  };
+function isPseudoId(id) {
+  return String(id || "").startsWith("pseudo.");
+}
 
-  const buckets = {
-    explicit: [],
-    implicit: [],
-    enchant: []
-  };
+function selectBestFilters(matches) {
+  const explicit = [];
+  const implicit = [];
+  const enchant = [];
 
   for (const m of dedupeMatches(matches)) {
-    buckets[m.category || "explicit"].push(m);
+    if (isPseudoId(m.id)) continue;
+
+    if (m.category === "implicit") implicit.push(m);
+    else if (m.category === "enchant") enchant.push(m);
+    else explicit.push(m);
   }
 
-  for (const key of Object.keys(buckets)) {
-    buckets[key].sort((a, b) => b.score - a.score);
-  }
+  explicit.sort((a, b) => b.score - a.score);
+  implicit.sort((a, b) => b.score - a.score);
+  enchant.sort((a, b) => b.score - a.score);
 
   const selected = [];
-  const usedIds = new Set();
+  const used = new Set();
 
-  function take(list, limit) {
-    let taken = 0;
-
-    for (const m of list) {
-      if (selected.length >= caps.total) break;
-      if (taken >= limit) break;
-      if (usedIds.has(m.id)) continue;
-      if (!isValidTradeStatId(m.id)) continue;
-
-      selected.push(m);
-      usedIds.add(m.id);
-      taken += 1;
+  function take(list, max) {
+    let count = 0;
+    for (const item of list) {
+      if (count >= max) break;
+      if (used.has(item.id)) continue;
+      used.add(item.id);
+      selected.push(item);
+      count += 1;
     }
   }
 
-  take(buckets.explicit, caps.explicit);
-  take(buckets.implicit, caps.implicit);
-  take(buckets.enchant, caps.enchant);
+  take(explicit, 2);
+  take(implicit, 1);
+  take(enchant, 1);
 
-  return selected.slice(0, caps.total);
+  return selected.slice(0, 3);
 }
 
 function mapModsToTradeFilters(mods) {

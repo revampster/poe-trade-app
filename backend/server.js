@@ -34,8 +34,13 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function safeJsonClone(obj) {
+function safeClone(obj) {
   return JSON.parse(JSON.stringify(obj));
+}
+
+function sanitizeLeagueName(league) {
+  const cleaned = String(league || "").trim();
+  return cleaned || DEFAULT_TRADE_LEAGUE;
 }
 
 app.get("/", (req, res) => {
@@ -46,11 +51,6 @@ app.get("/", (req, res) => {
     tradeStats: getTradeStatsStatus()
   });
 });
-
-function sanitizeLeagueName(league) {
-  const cleaned = String(league || "").trim();
-  return cleaned || DEFAULT_TRADE_LEAGUE;
-}
 
 function extractPobbId(url) {
   const clean = url.trim().replace(/\/+$/, "");
@@ -184,16 +184,16 @@ function decodeClusterInternalMod(line) {
   return null;
 }
 
+function isPassiveCountLine(line) {
+  const lower = stripPobTags(line).toLowerCase();
+  return /^adds\s+\d+\s+passive skills$/.test(lower);
+}
+
 function shouldSkipModLine(line) {
   const lower = stripPobTags(line).toLowerCase();
 
   return (
-    lower.includes("adds # passive skills") ||
-    lower.includes("adds 8 passive skills") ||
-    lower.includes("adds 9 passive skills") ||
-    lower.includes("adds 10 passive skills") ||
-    lower.includes("adds 11 passive skills") ||
-    lower.includes("adds 12 passive skills") ||
+    isPassiveCountLine(lower) ||
     lower.includes("passive skills are jewel sockets") ||
     lower.includes("allocates ") ||
     lower.includes("selection:") ||
@@ -215,6 +215,7 @@ function classifyMod(line) {
   const noTags = normalizeSpaces(stripPobTags(line));
 
   if (!raw) return null;
+  if (isPassiveCountLine(noTags)) return null;
 
   if (/^Enchant:/i.test(noTags)) {
     return {
@@ -355,7 +356,8 @@ function extractItemMeta(item, fallbackIndex) {
       displayName: `Item ${fallbackIndex + 1}`,
       searchName: "",
       searchType: "",
-      rawLines: []
+      rawLines: [],
+      isClusterJewel: false
     };
   }
 
@@ -371,6 +373,9 @@ function extractItemMeta(item, fallbackIndex) {
   let searchType = "";
   let displayName = `Item ${fallbackIndex + 1}`;
 
+  const clusterType = detectClusterBaseType(lines);
+  const isClusterJewel = !!clusterType;
+
   if (rarity === "Unique") {
     searchName = lines[1] || "";
     searchType = lines[2] || "";
@@ -380,7 +385,6 @@ function extractItemMeta(item, fallbackIndex) {
     searchType = lines[2] || "";
     displayName = [rareName, searchType].filter(Boolean).join(" ") || rareName || searchType || displayName;
   } else if (rarity === "Magic") {
-    const clusterType = detectClusterBaseType(lines);
     const magicName = lines[1] || "";
     const maybeBase = lines[2] || "";
 
@@ -395,8 +399,13 @@ function extractItemMeta(item, fallbackIndex) {
       displayName = magicName || displayName;
     }
   } else {
-    searchType = lines[1] || lines[0] || "";
-    displayName = searchType || displayName;
+    if (clusterType) {
+      searchType = clusterType;
+      displayName = clusterType;
+    } else {
+      searchType = lines[1] || lines[0] || "";
+      displayName = searchType || displayName;
+    }
   }
 
   return {
@@ -404,7 +413,8 @@ function extractItemMeta(item, fallbackIndex) {
     displayName,
     searchName,
     searchType,
-    rawLines: lines
+    rawLines: lines,
+    isClusterJewel
   };
 }
 
@@ -428,6 +438,7 @@ function normalizeItemsFromXml(result) {
       searchName: meta.searchName,
       searchType: meta.searchType,
       rawLines: meta.rawLines,
+      isClusterJewel: meta.isClusterJewel,
       mods
     };
   });
@@ -455,6 +466,13 @@ function buildStatsGroup(filters = []) {
   ];
 }
 
+function buildWebsiteFallbackLink(item, league) {
+  const finalLeague = encodeURIComponent(sanitizeLeagueName(league));
+  const text = [item.searchName, item.searchType].filter(Boolean).join(" ").trim() || item.displayName;
+  const query = encodeURIComponent(text);
+  return `https://www.pathofexile.com/trade/search/${finalLeague}?q=${query}`;
+}
+
 function buildBaseQuery(item, variant = "default") {
   const query = {
     query: {
@@ -468,6 +486,11 @@ function buildBaseQuery(item, variant = "default") {
   const name = String(item.searchName || "").trim();
 
   if (variant === "status-only") {
+    return query;
+  }
+
+  if (item.isClusterJewel) {
+    query.query.type = type || "Large Cluster Jewel";
     return query;
   }
 
@@ -499,11 +522,8 @@ function buildBaseQuery(item, variant = "default") {
     }
   }
 
-  if (type) {
-    query.query.type = type;
-  } else if (name) {
-    query.query.name = name;
-  }
+  if (type) query.query.type = type;
+  else if (name) query.query.name = name;
 
   return query;
 }
@@ -511,16 +531,19 @@ function buildBaseQuery(item, variant = "default") {
 function getBaseQueryCandidates(item) {
   const candidates = [];
 
-  if (item.rarity === "Unique") {
-    candidates.push({ label: "base-unique-name-type", query: buildBaseQuery(item, "unique-name-type") });
-    candidates.push({ label: "base-unique-type-only", query: buildBaseQuery(item, "type-only") });
-    candidates.push({ label: "base-unique-name-only", query: buildBaseQuery(item, "name-only") });
+  if (item.isClusterJewel) {
+    candidates.push({ label: "cluster-type-only", query: buildBaseQuery(item, "type-only") });
+    candidates.push({ label: "cluster-status-only", query: buildBaseQuery(item, "status-only") });
+  } else if (item.rarity === "Unique") {
+    candidates.push({ label: "unique-name-type", query: buildBaseQuery(item, "unique-name-type") });
+    candidates.push({ label: "unique-type-only", query: buildBaseQuery(item, "type-only") });
+    candidates.push({ label: "unique-name-only", query: buildBaseQuery(item, "name-only") });
+    candidates.push({ label: "unique-status-only", query: buildBaseQuery(item, "status-only") });
   } else {
-    candidates.push({ label: "base-type-only", query: buildBaseQuery(item, "type-only") });
-    candidates.push({ label: "base-name-only", query: buildBaseQuery(item, "name-only") });
+    candidates.push({ label: "type-only", query: buildBaseQuery(item, "type-only") });
+    candidates.push({ label: "name-only", query: buildBaseQuery(item, "name-only") });
+    candidates.push({ label: "status-only", query: buildBaseQuery(item, "status-only") });
   }
-
-  candidates.push({ label: "base-status-only", query: buildBaseQuery(item, "status-only") });
 
   const seen = new Set();
   return candidates.filter((c) => {
@@ -581,18 +604,13 @@ async function submitTradeSearch(queryObject, league) {
   };
 }
 
-function buildTradeResultLink(league, searchId) {
-  const finalLeague = encodeURIComponent(sanitizeLeagueName(league));
-  return `https://www.pathofexile.com/trade/search/${finalLeague}/${encodeURIComponent(searchId)}`;
-}
-
 function sanitizeDebugResponse(data) {
   if (data == null) return null;
-  if (typeof data === "string") return data.slice(0, 600);
+  if (typeof data === "string") return data.slice(0, 800);
   try {
-    return JSON.parse(JSON.stringify(data)).error
-      ? { error: data.error }
-      : JSON.parse(JSON.stringify(data));
+    const cloned = JSON.parse(JSON.stringify(data));
+    if (cloned.error) return { error: cloned.error };
+    return cloned;
   } catch {
     return { note: "unserializable response" };
   }
@@ -605,70 +623,79 @@ async function tryQuery(label, query, league, debugAttempts) {
     label,
     status: result.status,
     searchId: result?.data?.id || null,
-    query: safeJsonClone(query),
+    query: safeClone(query),
     response: sanitizeDebugResponse(result.data)
   });
 
   return result;
 }
 
+function buildTradeResultLink(league, searchId) {
+  const finalLeague = encodeURIComponent(sanitizeLeagueName(league));
+  return `https://www.pathofexile.com/trade/search/${finalLeague}/${encodeURIComponent(searchId)}`;
+}
+
 async function resolveTradeQuery(item, league) {
   const debugAttempts = [];
   const mapped = mapModsToTradeFilters(item.mods.slice(0, MAX_MODS_PER_ITEM));
   const strictCandidates = mapped.filters.filter((f) => isValidTradeStatId(f.id));
-
   const matchedDetails = mapped.debug.selected.filter((m) => isValidTradeStatId(m.id));
 
   let acceptedBase = null;
   let acceptedBaseLabel = null;
+  let acceptedSearchId = null;
 
   for (const candidate of getBaseQueryCandidates(item)) {
     const result = await tryQuery(candidate.label, candidate.query, league, debugAttempts);
     if (result.status === 200 && result?.data?.id) {
       acceptedBase = candidate.query;
       acceptedBaseLabel = candidate.label;
+      acceptedSearchId = result.data.id;
       break;
     }
-
     await sleep(SEARCH_DELAY_MS);
   }
 
   if (!acceptedBase) {
+    const websiteFallbackLink = buildWebsiteFallbackLink(item, league);
+
     return {
-      link: null,
+      link: websiteFallbackLink,
       searchId: null,
-      queryMode: "failed",
+      queryMode: "website-fallback",
       strictAccepted: false,
       fallbackAccepted: false,
       matchedMods: mapped.debug.selected.length,
       totalMods: item.mods.length,
-      matchedFilters: strictCandidates,
+      matchedFilters: [],
       matchedDetails,
       allMatchedMods: mapped.debug.allMatches,
       unmatchedMods: mapped.debug.unmatched,
       tradeStatsReady: mapped.debug.tradeStatsReady,
+      tradeQuery: null,
       debug: {
         itemMeta: {
           rarity: item.rarity,
           displayName: item.displayName,
           searchName: item.searchName,
-          searchType: item.searchType
+          searchType: item.searchType,
+          isClusterJewel: item.isClusterJewel
         },
         acceptedBaseLabel: null,
+        websiteFallbackLink,
         attempts: debugAttempts
       }
     };
   }
 
-  let acceptedQuery = safeJsonClone(acceptedBase);
-  let acceptedSearchId = debugAttempts[debugAttempts.length - 1].searchId;
+  let acceptedQuery = safeClone(acceptedBase);
   let queryMode = "fallback";
 
-  if (strictCandidates.length > 0) {
+  if (!item.isClusterJewel && strictCandidates.length > 0) {
     const acceptedFilters = [];
 
     for (const filter of strictCandidates) {
-      const nextQuery = safeJsonClone(acceptedQuery);
+      const nextQuery = safeClone(acceptedQuery);
       nextQuery.query.stats = buildStatsGroup([
         ...acceptedFilters,
         { id: filter.id, disabled: false }
@@ -714,9 +741,11 @@ async function resolveTradeQuery(item, league) {
         rarity: item.rarity,
         displayName: item.displayName,
         searchName: item.searchName,
-        searchType: item.searchType
+        searchType: item.searchType,
+        isClusterJewel: item.isClusterJewel
       },
       acceptedBaseLabel,
+      websiteFallbackLink: null,
       attempts: debugAttempts
     }
   };
@@ -836,7 +865,7 @@ app.post("/generate", async (req, res) => {
         strictAccepted: resolved.strictAccepted,
         fallbackAccepted: resolved.fallbackAccepted,
         tradeStatsReady: resolved.tradeStatsReady,
-        tradeQuery: resolved.tradeQuery || null,
+        tradeQuery: resolved.tradeQuery,
         debug: ENABLE_DEBUG ? resolved.debug : undefined
       });
 
