@@ -4,6 +4,8 @@ const axios = require("axios");
 const xml2js = require("xml2js");
 const zlib = require("zlib");
 const {
+  initTradeStats,
+  getTradeStatsStatus,
   mapModsToTradeFilters,
   buildTradeStats,
   isValidTradeStatId
@@ -24,7 +26,8 @@ app.get("/", (req, res) => {
   res.json({
     ok: true,
     message: "PoE Trade backend is live",
-    defaultTradeLeague: DEFAULT_TRADE_LEAGUE
+    defaultTradeLeague: DEFAULT_TRADE_LEAGUE,
+    tradeStats: getTradeStatsStatus()
   });
 });
 
@@ -447,7 +450,8 @@ function buildSafeTradeQuery(item) {
     strictQuery,
     fallbackQuery,
     chosenQuery,
-    useStrict
+    useStrict,
+    tradeStatsReady: mapped.debug.tradeStatsReady
   };
 }
 
@@ -468,7 +472,7 @@ async function estimatePrice(tradeQuery, league) {
       sanitizeLeagueName(league)
     )}`;
 
-    const payload = tradeQuery.query || tradeQuery;
+    const payload = tradeQuery;
 
     const searchRes = await axios.post(searchUrl, payload, {
       headers: POE_HEADERS,
@@ -535,12 +539,15 @@ app.post("/generate", async (req, res) => {
   const started = Date.now();
 
   try {
+    await initTradeStats();
+
     const { input, league, estimatePrices = false } = req.body;
 
     console.log("START /generate", {
       estimatePrices,
       league,
-      hasInput: !!input
+      hasInput: !!input,
+      tradeStats: getTradeStatsStatus()
     });
 
     if (!input || !input.trim()) {
@@ -578,11 +585,12 @@ app.post("/generate", async (req, res) => {
         totalMods: built.totalMods,
         ms: Date.now() - t0,
         useStrict: built.useStrict,
+        tradeStatsReady: built.tradeStatsReady,
         matchedFilters: built.matchedDetails.map((m) => ({
           mod: m.mod,
           id: m.id,
           score: m.score,
-          via: m.via
+          type: m.type
         }))
       });
 
@@ -616,6 +624,7 @@ app.post("/generate", async (req, res) => {
           allMatchedMods: entry.built.allMatchedMods,
           unmatchedMods: entry.built.unmatchedMods,
           queryMode,
+          tradeStatsReady: entry.built.tradeStatsReady,
           tradeQuery: chosenQuery,
           strictTradeQuery: entry.built.strictQuery,
           fallbackTradeQuery: entry.built.fallbackQuery,
@@ -631,6 +640,7 @@ app.post("/generate", async (req, res) => {
 
     return res.json({
       league: selectedLeague,
+      tradeStats: getTradeStatsStatus(),
       results: finalResults
     });
   } catch (err) {
@@ -639,6 +649,10 @@ app.post("/generate", async (req, res) => {
       error: err.message || "Failed to generate trade links."
     });
   }
+});
+
+initTradeStats().catch((err) => {
+  console.error("Trade stats init failed:", err.message);
 });
 
 app.listen(PORT, "0.0.0.0", () => {

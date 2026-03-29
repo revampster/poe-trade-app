@@ -1,25 +1,18 @@
-const modsData = require("./data/mods.json");
-const statTranslations = require("./data/stat_translations.json");
+const axios = require("axios");
 
-/*
-  IMPORTANT:
-  - stat_translations.json is useful for text matching
-  - but its raw ids are NOT guaranteed to be valid trade-site stat ids
-  - only ids in the trade format should ever be emitted into a trade query
-
-  Valid trade ids look like:
-    explicit.stat_...
-    implicit.stat_...
-    enchant.stat_...
-    fractured.stat_...
-    crafted.stat_...
-    pseudo.pseudo_...
-    rune.stat_...
-    monster.stat_...
-*/
+const TRADE_STATS_URL = "https://www.pathofexile.com/api/trade/data/stats";
+const TRADE_STATS_REFRESH_MS = 1000 * 60 * 60 * 6; // 6 hours
 
 const TRADE_ID_RE =
-  /^(explicit|implicit|enchant|fractured|crafted|pseudo|rune|monster)\.(stat|pseudo)_[A-Za-z0-9_]+$/;
+  /^(explicit|implicit|enchant|fractured|crafted|pseudo|rune|monster|veiled|delve)\.(stat|pseudo)_[A-Za-z0-9_]+$/;
+
+const state = {
+  initialized: false,
+  loading: null,
+  loadedAt: 0,
+  entryCount: 0,
+  entries: []
+};
 
 /* ---------------- NORMALIZE ---------------- */
 
@@ -47,104 +40,112 @@ function isValidTradeStatId(id) {
   return TRADE_ID_RE.test(String(id || ""));
 }
 
-/* ---------------- BUILD MATCH INDEX ---------------- */
+/* ---------------- TRADE STATS LOADING ---------------- */
 
-const MATCHABLE_STATS = [];
-const VALID_TRADE_IDS = new Set();
+function extractEntryTexts(entry) {
+  const texts = [];
 
-/*
-  We still load stat_translations for text matching, but we only keep ids that
-  already look like actual trade ids.
-*/
-(function buildStatIndex() {
-  const entries = Array.isArray(statTranslations)
-    ? statTranslations
-    : statTranslations.translations || [];
+  if (typeof entry?.text === "string") texts.push(entry.text);
 
-  for (const entry of entries) {
-    const ids = Array.isArray(entry.ids) ? entry.ids : [];
-
-    let strings = [];
-
-    if (Array.isArray(entry.English)) {
-      for (const block of entry.English) {
-        if (typeof block === "string") {
-          strings.push(block);
-        }
-
-        if (block && block.string) {
-          if (Array.isArray(block.string)) {
-            strings.push(...block.string);
-          } else if (typeof block.string === "string") {
-            strings.push(block.string);
-          }
-        }
-      }
+  if (Array.isArray(entry?.option?.options)) {
+    for (const opt of entry.option.options) {
+      if (typeof opt?.text === "string") texts.push(opt.text);
     }
+  }
 
-    strings = uniq(strings.map(normalize).filter(Boolean));
+  return uniq(texts.map(normalize).filter(Boolean));
+}
 
-    for (const id of ids) {
+function buildTradeStatEntries(payload) {
+  const groups = Array.isArray(payload?.result) ? payload.result : [];
+  const out = [];
+
+  for (const group of groups) {
+    const groupId = String(group?.id || "");
+    const entries = Array.isArray(group?.entries) ? group.entries : [];
+
+    for (const entry of entries) {
+      const id = String(entry?.id || "");
+      const type = String(entry?.type || groupId || "");
+
       if (!isValidTradeStatId(id)) continue;
 
-      VALID_TRADE_IDS.add(id);
-      MATCHABLE_STATS.push({
+      const texts = extractEntryTexts(entry);
+      if (!texts.length) continue;
+
+      out.push({
         id,
-        texts: strings
+        type,
+        texts
       });
     }
   }
 
-  console.log("VALID TRADE-FORMAT STAT IDS:", VALID_TRADE_IDS.size);
-})();
+  return out;
+}
 
-/*
-  Optional alias support from mods.json:
-  We only use aliases to improve text recall, never as a source of trusted ids
-  unless the alias already contains a valid trade-format id.
-*/
-const MOD_ALIASES = [];
+async function refreshTradeStats() {
+  const res = await axios.get(TRADE_STATS_URL, {
+    timeout: 15000,
+    headers: {
+      "User-Agent": "poe-trade-app/1.0",
+      "Accept": "application/json"
+    },
+    validateStatus: () => true
+  });
 
-(function buildModAliasIndex() {
-  const rows = [];
-
-  if (Array.isArray(modsData)) {
-    rows.push(...modsData);
-  } else if (modsData && typeof modsData === "object") {
-    for (const value of Object.values(modsData)) {
-      if (Array.isArray(value)) rows.push(...value);
-    }
+  if (res.status !== 200 || !res.data) {
+    throw new Error(`Failed to load trade stats (${res.status})`);
   }
 
-  for (const row of rows) {
-    if (!row || typeof row !== "object") continue;
+  const entries = buildTradeStatEntries(res.data);
 
-    const aliasTexts = [];
-
-    for (const key of ["text", "name", "stat", "mod", "tradeText", "match"]) {
-      if (typeof row[key] === "string") aliasTexts.push(row[key]);
-    }
-
-    if (Array.isArray(row.aliases)) {
-      aliasTexts.push(...row.aliases.filter((x) => typeof x === "string"));
-    }
-
-    const possibleId =
-      row.tradeStatId ||
-      row.trade_stat_id ||
-      row.statId ||
-      row.tradeId ||
-      row.id ||
-      null;
-
-    MOD_ALIASES.push({
-      texts: uniq(aliasTexts.map(normalize).filter(Boolean)),
-      tradeId: isValidTradeStatId(possibleId) ? possibleId : null
-    });
+  if (!entries.length) {
+    throw new Error("Trade stats loaded but contained no valid trade stat entries.");
   }
-})();
 
-/* ---------------- SCORING ---------------- */
+  state.entries = entries;
+  state.entryCount = entries.length;
+  state.loadedAt = Date.now();
+  state.initialized = true;
+
+  console.log("TRADE STAT ENTRIES:", state.entryCount);
+}
+
+async function initTradeStats(force = false) {
+  const freshEnough =
+    state.initialized &&
+    Date.now() - state.loadedAt < TRADE_STATS_REFRESH_MS;
+
+  if (!force && freshEnough) {
+    return getTradeStatsStatus();
+  }
+
+  if (state.loading) {
+    return state.loading;
+  }
+
+  state.loading = (async () => {
+    try {
+      await refreshTradeStats();
+      return getTradeStatsStatus();
+    } finally {
+      state.loading = null;
+    }
+  })();
+
+  return state.loading;
+}
+
+function getTradeStatsStatus() {
+  return {
+    initialized: state.initialized,
+    loadedAt: state.loadedAt,
+    entryCount: state.entryCount
+  };
+}
+
+/* ---------------- MATCHING ---------------- */
 
 function score(a, b) {
   if (!a || !b) return 0;
@@ -155,51 +156,59 @@ function score(a, b) {
 
   if (!ta.length || !tb.length) return 0;
 
-  let match = 0;
+  let overlap = 0;
   for (const t of ta) {
-    if (tb.includes(t)) match++;
+    if (tb.includes(t)) overlap++;
   }
 
-  const overlapScore = match / Math.max(ta.length, tb.length);
+  const overlapScore = overlap / Math.max(ta.length, tb.length);
+
   if (a.includes(b) || b.includes(a)) {
-    return Math.max(overlapScore, 0.9);
+    return Math.max(overlapScore, 0.92);
   }
 
   return overlapScore;
 }
 
-function findBestStat(text) {
+function inferCategory(modObj, hitType) {
+  const kind = typeof modObj === "object" ? modObj?.kind : null;
+  const t = String(
+    typeof modObj === "string"
+      ? modObj
+      : modObj?.text || modObj?.name || ""
+  ).toLowerCase();
+
+  if (kind === "implicit" || hitType === "implicit" || t.includes("implicit")) {
+    return "implicit";
+  }
+
+  if (kind === "enchant" || hitType === "enchant" || t.includes("enchant")) {
+    return "enchant";
+  }
+
+  return "explicit";
+}
+
+function findBestTradeStat(text) {
+  if (!state.initialized || !state.entries.length) {
+    return null;
+  }
+
   const norm = normalize(text);
+  if (!norm) return null;
+
   let best = null;
 
-  for (const stat of MATCHABLE_STATS) {
-    for (const t of stat.texts) {
-      const s = score(norm, t);
+  for (const entry of state.entries) {
+    for (const candidate of entry.texts) {
+      const s = score(norm, candidate);
 
       if (!best || s > best.score) {
         best = {
-          id: stat.id,
+          id: entry.id,
+          type: entry.type,
           score: s,
-          match: t,
-          via: "trade-stat-text"
-        };
-      }
-    }
-  }
-
-  for (const row of MOD_ALIASES) {
-    for (const t of row.texts) {
-      const s = score(norm, t);
-
-      if (
-        row.tradeId &&
-        (!best || s > best.score)
-      ) {
-        best = {
-          id: row.tradeId,
-          score: s,
-          match: t,
-          via: "mods-alias"
+          match: candidate
         };
       }
     }
@@ -207,42 +216,20 @@ function findBestStat(text) {
 
   if (!best) return null;
 
-  // Require strong confidence since strict mode is fragile.
   if (best.score < 0.55) return null;
-
-  // Safety check
   if (!isValidTradeStatId(best.id)) return null;
 
   return best;
 }
 
-/* ---------------- CATEGORY DETECTION ---------------- */
-
-function getCategory(modObj) {
-  const kind = typeof modObj === "object" ? modObj?.kind : null;
-  const text = typeof modObj === "string"
-    ? modObj
-    : modObj?.text || modObj?.name || "";
-
-  if (kind === "implicit") return "implicit";
-  if (kind === "enchant") return "enchant";
-
-  const t = String(text || "").toLowerCase();
-  if (t.includes("implicit")) return "implicit";
-  if (t.includes("enchant")) return "enchant";
-
-  return "explicit";
-}
-
-/* ---------------- OPTIMIZED SELECTION ---------------- */
+/* ---------------- FILTER SELECTION ---------------- */
 
 function dedupeMatches(matches) {
   const seen = new Set();
   const out = [];
 
   for (const m of matches.sort((a, b) => b.score - a.score)) {
-    if (!m?.id) continue;
-    if (seen.has(m.id)) continue;
+    if (!m?.id || seen.has(m.id)) continue;
     seen.add(m.id);
     out.push(m);
   }
@@ -265,8 +252,7 @@ function selectBestFilters(matches) {
   };
 
   for (const m of dedupeMatches(matches)) {
-    const cat = m.category || "explicit";
-    buckets[cat].push(m);
+    buckets[m.category || "explicit"].push(m);
   }
 
   for (const key of Object.keys(buckets)) {
@@ -301,6 +287,21 @@ function selectBestFilters(matches) {
 /* ---------------- MAIN ---------------- */
 
 function mapModsToTradeFilters(mods) {
+  if (!state.initialized || !state.entries.length) {
+    return {
+      useStrict: false,
+      filters: [],
+      debug: {
+        allMatches: [],
+        selected: [],
+        unmatched: (mods || []).map((m) =>
+          typeof m === "string" ? m : m?.text || m?.name || ""
+        ).filter(Boolean),
+        tradeStatsReady: false
+      }
+    };
+  }
+
   const matches = [];
   const unmatched = [];
 
@@ -312,13 +313,8 @@ function mapModsToTradeFilters(mods) {
 
     if (!text) continue;
 
-    const hit = findBestStat(text);
+    const hit = findBestTradeStat(text);
     if (!hit) {
-      unmatched.push(text);
-      continue;
-    }
-
-    if (!isValidTradeStatId(hit.id)) {
       unmatched.push(text);
       continue;
     }
@@ -328,14 +324,14 @@ function mapModsToTradeFilters(mods) {
       id: hit.id,
       score: hit.score,
       match: hit.match,
-      via: hit.via,
-      category: getCategory(mod)
+      type: hit.type,
+      category: inferCategory(mod, hit.type)
     });
   }
 
-  const best = selectBestFilters(matches);
+  const selected = selectBestFilters(matches);
 
-  const filters = best
+  const filters = selected
     .filter((m) => isValidTradeStatId(m.id))
     .map((m) => ({
       id: m.id,
@@ -347,9 +343,9 @@ function mapModsToTradeFilters(mods) {
     filters,
     debug: {
       allMatches: matches,
-      selected: best,
+      selected,
       unmatched,
-      validTradeIdCount: VALID_TRADE_IDS.size
+      tradeStatsReady: true
     }
   };
 }
@@ -371,6 +367,8 @@ function buildTradeStats(filters) {
 }
 
 module.exports = {
+  initTradeStats,
+  getTradeStatsStatus,
   mapModsToTradeFilters,
   buildTradeStats,
   isValidTradeStatId,
