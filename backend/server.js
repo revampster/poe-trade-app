@@ -3,7 +3,11 @@ const cors = require("cors");
 const axios = require("axios");
 const xml2js = require("xml2js");
 const zlib = require("zlib");
-const { mapModsToTradeFilters, buildTradeStats } = require("./modMapper");
+const {
+  mapModsToTradeFilters,
+  buildTradeStats,
+  isValidTradeStatId
+} = require("./modMapper");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -305,6 +309,7 @@ function parseModsFromItemText(itemText) {
 
     mods.push({
       name: classified.text,
+      text: classified.text,
       tier: null,
       kind: classified.kind
     });
@@ -420,26 +425,29 @@ function buildFallbackQuery(item) {
 function buildSafeTradeQuery(item) {
   const mapped = mapModsToTradeFilters(item.mods.slice(0, MAX_MODS_PER_ITEM));
 
-  const strictQuery = buildFallbackQuery(item);
-
-  if (mapped.useStrict && mapped.filters.length) {
-    strictQuery.query.stats = buildTradeStats(mapped.filters);
-  }
+  const validStrictFilters = mapped.filters.filter((f) => isValidTradeStatId(f.id));
 
   const fallbackQuery = buildFallbackQuery(item);
-  const chosenQuery = mapped.useStrict ? strictQuery : fallbackQuery;
+  const strictQuery = buildFallbackQuery(item);
+
+  if (validStrictFilters.length > 0) {
+    strictQuery.query.stats = buildTradeStats(validStrictFilters);
+  }
+
+  const useStrict = validStrictFilters.length > 0;
+  const chosenQuery = useStrict ? strictQuery : fallbackQuery;
 
   return {
     matchedMods: mapped.debug.selected.length,
     totalMods: item.mods.length,
-    matchedFilters: mapped.filters,
-    matchedDetails: mapped.debug.selected,
+    matchedFilters: validStrictFilters,
+    matchedDetails: mapped.debug.selected.filter((m) => isValidTradeStatId(m.id)),
     allMatchedMods: mapped.debug.allMatches,
     unmatchedMods: mapped.debug.unmatched,
     strictQuery,
     fallbackQuery,
     chosenQuery,
-    useStrict: mapped.useStrict
+    useStrict
   };
 }
 
@@ -460,7 +468,9 @@ async function estimatePrice(tradeQuery, league) {
       sanitizeLeagueName(league)
     )}`;
 
-    const searchRes = await axios.post(searchUrl, tradeQuery.query, {
+    const payload = tradeQuery.query || tradeQuery;
+
+    const searchRes = await axios.post(searchUrl, payload, {
       headers: POE_HEADERS,
       validateStatus: () => true,
       timeout: 8000
@@ -571,7 +581,8 @@ app.post("/generate", async (req, res) => {
         matchedFilters: built.matchedDetails.map((m) => ({
           mod: m.mod,
           id: m.id,
-          score: m.score
+          score: m.score,
+          via: m.via
         }))
       });
 
