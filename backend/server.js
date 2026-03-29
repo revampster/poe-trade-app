@@ -3,7 +3,7 @@ const cors = require("cors");
 const axios = require("axios");
 const xml2js = require("xml2js");
 const zlib = require("zlib");
-const { findModByText, getTierRange } = require("./modMapper");
+const { mapModsToTradeFilters, buildTradeStats } = require("./modMapper");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -11,7 +11,6 @@ const DEFAULT_TRADE_LEAGUE = process.env.TRADE_LEAGUE || "Mirage";
 
 const MAX_ITEMS_TO_PROCESS = 8;
 const MAX_MODS_PER_ITEM = 10;
-const MAX_BUILD_QUERY_MS = 1500;
 const MAX_PRICE_CHECKS = 2;
 
 app.use(cors());
@@ -133,17 +132,17 @@ function decodeClusterInternalMod(line) {
   const cleaned = stripPobTags(line);
 
   const direct = {
-    "AfflictionJewelSmallPassivesHaveIncreasedEffect2":
+    AfflictionJewelSmallPassivesHaveIncreasedEffect2:
       "Added Small Passive Skills have increased Effect",
-    "AfflictionJewelSmallPassivesGrantDex3_":
+    AfflictionJewelSmallPassivesGrantDex3_:
       "Added Small Passive Skills also grant: +# to Dexterity",
-    "AfflictionJewelSmallPassivesGrantLife3":
+    AfflictionJewelSmallPassivesGrantLife3:
       "Added Small Passive Skills also grant: +# to Maximum Life",
-    "AfflictionJewelSmallPassivesGrantMinionAttackAndCastSpeed3":
+    AfflictionJewelSmallPassivesGrantMinionAttackAndCastSpeed3:
       "Added Small Passive Skills also grant: Minions have increased Attack and Cast Speed",
-    "AfflictionJewelSmallPassivesGrantMinionDamage3":
+    AfflictionJewelSmallPassivesGrantMinionDamage3:
       "Added Small Passive Skills also grant: Minions deal increased Damage",
-    "AfflictionJewelSmallPassivesGrantAllRes3":
+    AfflictionJewelSmallPassivesGrantAllRes3:
       "Added Small Passive Skills also grant: +#% to all Elemental Resistances"
   };
 
@@ -258,6 +257,7 @@ function parseModsFromItemText(itemText) {
 
     if (
       line.startsWith("Rarity:") ||
+      line === "--------" ||
       line === "Corrupted" ||
       line === "Unidentified" ||
       line.startsWith("Note:")
@@ -398,149 +398,48 @@ async function parsePoB(input) {
   return normalizeItemsFromXml(result);
 }
 
-function normalizeTierIndex(tier) {
-  if (!tier || typeof tier !== "string") return 0;
-  const match = tier.match(/^T(\d+)$/i);
-  if (!match) return 0;
-  return Math.max(parseInt(match[1], 10) - 1, 0);
-}
-
-function isValidFilter(filter) {
-  return (
-    filter &&
-    typeof filter.id === "string" &&
-    filter.id.trim().length > 0 &&
-    filter.value &&
-    typeof filter.value.min === "number" &&
-    typeof filter.value.max === "number" &&
-    Number.isFinite(filter.value.min) &&
-    Number.isFinite(filter.value.max)
-  );
-}
-
-function dedupeFilters(filters) {
-  const seen = new Set();
-  const out = [];
-
-  for (const filter of filters) {
-    const key = `${filter.id}:${filter.value.min}:${filter.value.max}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(filter);
-  }
-
-  return out;
-}
-
 function buildFallbackQuery(item) {
-  const base = {
+  const query = {
     query: {
       status: { option: "online" },
       stats: []
-    }
+    },
+    sort: { price: "asc" }
   };
 
   if (item.rarity === "Unique" && item.searchName) {
-    base.query.name = item.searchName;
-    if (item.searchType) base.query.type = item.searchType;
+    query.query.name = item.searchName;
+    if (item.searchType) query.query.type = item.searchType;
   } else if (item.searchType) {
-    base.query.type = item.searchType;
+    query.query.type = item.searchType;
   }
 
-  return base;
+  return query;
 }
 
 function buildSafeTradeQuery(item) {
-  const started = Date.now();
-
-  const explicitFilters = [];
-  const implicitFilters = [];
-  const enchantFilters = [];
-
-  let matchedMods = 0;
-  const matchedDetails = [];
-  const unmatchedMods = [];
-
-  for (const mod of item.mods.slice(0, MAX_MODS_PER_ITEM)) {
-    if (Date.now() - started > MAX_BUILD_QUERY_MS) {
-      console.warn("buildTradeQuery timeout", { item: item.displayName });
-      break;
-    }
-
-    const found = findModByText(mod.name);
-
-    if (!found) {
-      unmatchedMods.push(mod.name);
-      continue;
-    }
-
-    const tierIndex = normalizeTierIndex(mod.tier);
-    const range = getTierRange(found, tierIndex);
-
-    if (!range || typeof range.statId !== "string" || !range.statId.trim()) {
-      unmatchedMods.push(mod.name);
-      continue;
-    }
-
-    const filter = {
-      id: range.statId,
-      value: {
-        min: Number(range.min),
-        max: Number(range.max)
-      }
-    };
-
-    if (!isValidFilter(filter)) {
-      unmatchedMods.push(mod.name);
-      continue;
-    }
-
-    if (mod.kind === "implicit") {
-      implicitFilters.push(filter);
-    } else if (mod.kind === "enchant") {
-      enchantFilters.push(filter);
-    } else {
-      explicitFilters.push(filter);
-    }
-
-    matchedMods += 1;
-    matchedDetails.push({
-      inputMod: mod.name,
-      kind: mod.kind || "explicit",
-      statId: range.statId,
-      min: Number(range.min),
-      max: Number(range.max),
-      score: found.score
-    });
-  }
-
-  const allFilters = dedupeFilters([
-    ...explicitFilters,
-    ...implicitFilters,
-    ...enchantFilters
-  ]).filter(isValidFilter);
+  const mapped = mapModsToTradeFilters(item.mods.slice(0, MAX_MODS_PER_ITEM));
 
   const strictQuery = buildFallbackQuery(item);
 
-  if (allFilters.length) {
-    strictQuery.query.stats = [
-      {
-        type: "and",
-        filters: allFilters
-      }
-    ];
+  if (mapped.useStrict && mapped.filters.length) {
+    strictQuery.query.stats = buildTradeStats(mapped.filters);
   }
 
   const fallbackQuery = buildFallbackQuery(item);
+  const chosenQuery = mapped.useStrict ? strictQuery : fallbackQuery;
 
   return {
-    matchedMods,
+    matchedMods: mapped.debug.selected.length,
     totalMods: item.mods.length,
-    matchedDetails,
-    unmatchedMods,
+    matchedFilters: mapped.filters,
+    matchedDetails: mapped.debug.selected,
+    allMatchedMods: mapped.debug.allMatches,
+    unmatchedMods: mapped.debug.unmatched,
     strictQuery,
     fallbackQuery,
-    useStrict: allFilters.length > 0
+    chosenQuery,
+    useStrict: mapped.useStrict
   };
 }
 
@@ -557,7 +456,10 @@ const POE_HEADERS = {
 
 async function estimatePrice(tradeQuery, league) {
   try {
-    const searchUrl = `https://www.pathofexile.com/api/trade/search/${encodeURIComponent(sanitizeLeagueName(league))}`;
+    const searchUrl = `https://www.pathofexile.com/api/trade/search/${encodeURIComponent(
+      sanitizeLeagueName(league)
+    )}`;
+
     const searchRes = await axios.post(searchUrl, tradeQuery.query, {
       headers: POE_HEADERS,
       validateStatus: () => true,
@@ -569,8 +471,13 @@ async function estimatePrice(tradeQuery, league) {
     }
 
     const ids = searchRes.data.result.slice(0, 10);
+
     if (!ids.length) {
-      return { totalListed: 0, cheapest: null, examples: [] };
+      return {
+        totalListed: 0,
+        cheapest: null,
+        examples: []
+      };
     }
 
     const fetchUrl =
@@ -660,7 +567,12 @@ app.post("/generate", async (req, res) => {
         matchedMods: built.matchedMods,
         totalMods: built.totalMods,
         ms: Date.now() - t0,
-        useStrict: built.useStrict
+        useStrict: built.useStrict,
+        matchedFilters: built.matchedDetails.map((m) => ({
+          mod: m.mod,
+          id: m.id,
+          score: m.score
+        }))
       });
 
       builtResults.push({ item, built });
@@ -668,7 +580,8 @@ app.post("/generate", async (req, res) => {
 
     const finalResults = await Promise.all(
       builtResults.map(async (entry, index) => {
-        const chosenQuery = entry.built.fallbackQuery;
+        const chosenQuery = entry.built.chosenQuery;
+        const queryMode = entry.built.useStrict ? "strict" : "fallback";
 
         let priceEstimate = null;
         if (estimatePrices && index < MAX_PRICE_CHECKS) {
@@ -687,9 +600,14 @@ app.post("/generate", async (req, res) => {
             entry.built.totalMods > 0
               ? Math.round((entry.built.matchedMods / entry.built.totalMods) * 100)
               : 0,
+          matchedFilters: entry.built.matchedFilters,
           matchedDetails: entry.built.matchedDetails,
+          allMatchedMods: entry.built.allMatchedMods,
           unmatchedMods: entry.built.unmatchedMods,
-          queryMode: "fallback",
+          queryMode,
+          tradeQuery: chosenQuery,
+          strictTradeQuery: entry.built.strictQuery,
+          fallbackTradeQuery: entry.built.fallbackQuery,
           priceEstimate
         };
       })
