@@ -1,15 +1,14 @@
 {
-  "name": "poe-trade-backend",
+  "name": "poe-backend",
   "version": "1.0.0",
-  "description": "Backend API for PoE Trade Link Generator",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "axios": "^1.7.9",
+    "axios": "^1.6.0",
     "cors": "^2.8.5",
-    "express": "^4.21.2",
+    "express": "^4.18.2",
     "xml2js": "^0.6.2"
   }
 }
