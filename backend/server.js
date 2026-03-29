@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const xml2js = require("xml2js");
+const zlib = require("zlib");
 const { findModByText, getTierRange } = require("./modMapper");
 
 const app = express();
@@ -46,7 +47,10 @@ async function fetchPoBData(input) {
   if (input.includes("pastebin.com")) {
     const id = input.trim().split("/").pop();
     const res = await axios.get(`https://pastebin.com/raw/${id}`, {
-      validateStatus: () => true
+      validateStatus: () => true,
+      headers: {
+        "User-Agent": "poe-trade-app/1.0"
+      }
     });
 
     if (res.status !== 200) {
@@ -59,7 +63,10 @@ async function fetchPoBData(input) {
   if (input.includes("pobb.in")) {
     const id = extractPobbId(input);
     const res = await axios.get(`https://pobb.in/${id}/raw`, {
-      validateStatus: () => true
+      validateStatus: () => true,
+      headers: {
+        "User-Agent": "poe-trade-app/1.0"
+      }
     });
 
     if (res.status !== 200) {
@@ -69,7 +76,35 @@ async function fetchPoBData(input) {
     data = res.data;
   }
 
-  return data;
+  return typeof data === "string" ? data.trim() : data;
+}
+
+function maybeDecodePoB(data) {
+  if (typeof data !== "string") {
+    throw new Error("PoB data is not a string.");
+  }
+
+  const trimmed = data.trim();
+
+  // Already XML
+  if (trimmed.startsWith("<")) {
+    return trimmed;
+  }
+
+  // Likely base64-compressed PoB code
+  try {
+    const compressed = Buffer.from(trimmed, "base64");
+
+    // Try inflateRaw first
+    try {
+      return zlib.inflateRawSync(compressed).toString("utf8");
+    } catch {
+      // Then try inflate
+      return zlib.inflateSync(compressed).toString("utf8");
+    }
+  } catch (err) {
+    throw new Error("Fetched build was not XML and could not be decoded as a PoB code.");
+  }
 }
 
 function normalizeItemsFromXml(result) {
@@ -103,14 +138,15 @@ function normalizeItemsFromXml(result) {
 
 async function parsePoB(input) {
   try {
-    const data = await fetchPoBData(input);
+    const rawData = await fetchPoBData(input);
+    const xmlData = maybeDecodePoB(rawData);
 
     const parser = new xml2js.Parser({
       explicitArray: true,
       mergeAttrs: false
     });
 
-    const result = await parser.parseStringPromise(data);
+    const result = await parser.parseStringPromise(xmlData);
     return normalizeItemsFromXml(result);
   } catch (err) {
     console.error("PoB Parsing Error:", err.message);
@@ -154,9 +190,7 @@ function buildTradeQuery(item) {
       query: {
         status: { option: "online" },
         name: item.name,
-        stats: filters.length
-          ? [{ type: "and", filters }]
-          : []
+        stats: filters.length ? [{ type: "and", filters }] : []
       }
     }
   };
