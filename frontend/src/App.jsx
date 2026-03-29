@@ -4,6 +4,7 @@ import axios from "axios";
 export default function App() {
   const [input, setInput] = useState("");
   const [league, setLeague] = useState("Mirage");
+  const [estimatePrices, setEstimatePrices] = useState(false);
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -30,7 +31,8 @@ export default function App() {
     try {
       const res = await axios.post(`${API_URL}/generate`, {
         input,
-        league
+        league,
+        estimatePrices
       });
 
       if (res.data && Array.isArray(res.data.results)) {
@@ -64,6 +66,49 @@ export default function App() {
     "Solo Self-Found",
     "Hardcore Solo Self-Found"
   ];
+
+  function renderPriceEstimate(priceEstimate) {
+    if (!estimatePrices) return null;
+
+    if (!priceEstimate) {
+      return <p style={{ marginTop: 8 }}>No price estimate available.</p>;
+    }
+
+    return (
+      <div style={{ marginTop: 8 }}>
+        <p style={{ margin: "6px 0" }}>
+          <strong>Total Listed:</strong>{" "}
+          {priceEstimate.totalListed ?? "Unknown"}
+        </p>
+
+        {priceEstimate.cheapest ? (
+          <p style={{ margin: "6px 0" }}>
+            <strong>Cheapest:</strong>{" "}
+            {priceEstimate.cheapest.amount} {priceEstimate.cheapest.currency}
+            {priceEstimate.cheapest.account
+              ? ` (${priceEstimate.cheapest.account})`
+              : ""}
+          </p>
+        ) : (
+          <p style={{ margin: "6px 0" }}>No priced listings found.</p>
+        )}
+
+        {priceEstimate.examples && priceEstimate.examples.length > 0 && (
+          <div style={{ marginTop: 8 }}>
+            <strong>Example Listings</strong>
+            <ul style={{ marginTop: 8 }}>
+              {priceEstimate.examples.map((ex, idx) => (
+                <li key={idx}>
+                  {ex.amount} {ex.currency}
+                  {ex.account ? ` — ${ex.account}` : ""}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div
@@ -100,6 +145,21 @@ export default function App() {
             </option>
           ))}
         </select>
+      </div>
+
+      <div style={{ marginBottom: 16 }}>
+        <label
+          htmlFor="estimate-prices"
+          style={{ display: "inline-flex", alignItems: "center", gap: 8 }}
+        >
+          <input
+            id="estimate-prices"
+            type="checkbox"
+            checked={estimatePrices}
+            onChange={(e) => setEstimatePrices(e.target.checked)}
+          />
+          Estimate prices
+        </label>
       </div>
 
       <textarea
@@ -179,6 +239,11 @@ export default function App() {
             </p>
 
             <div style={{ marginTop: 12 }}>
+              <strong>Price Estimate</strong>
+              {renderPriceEstimate(r.priceEstimate)}
+            </div>
+
+            <div style={{ marginTop: 12 }}>
               <strong>Matched Details</strong>
               {r.matchedDetails && r.matchedDetails.length > 0 ? (
                 <div style={{ marginTop: 8 }}>
@@ -193,6 +258,7 @@ export default function App() {
                       }}
                     >
                       <div><strong>Input Mod:</strong> {m.inputMod}</div>
+                      <div><strong>Kind:</strong> {m.kind}</div>
                       <div><strong>Stat ID:</strong> {m.statId}</div>
                       <div><strong>Range:</strong> {m.min} - {m.max}</div>
                       <div><strong>Match Score:</strong> {m.score}</div>
