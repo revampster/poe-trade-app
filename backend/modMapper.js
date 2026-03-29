@@ -11,33 +11,35 @@ function normalize(text) {
     .trim();
 }
 
-/**
- * 🔥 PREBUILD INDEX (runs once on startup)
- */
 const MOD_INDEX = {};
 
 function buildIndex() {
   for (const mod of Object.values(modsData)) {
     if (!mod?.stats) continue;
 
-    for (const stat of mod.stats) {
+    for (let i = 0; i < mod.stats.length; i++) {
+      const stat = mod.stats[i];
       if (!stat?.id) continue;
 
-      // index stat id
-      const normId = normalize(stat.id);
-      if (!MOD_INDEX[normId]) {
-        MOD_INDEX[normId] = { mod, stat };
-      }
+      const keyId = normalize(stat.id);
 
-      // index translation strings
+      MOD_INDEX[keyId] = {
+        mod,
+        statIndex: i
+      };
+
       for (const entry of Object.values(statTranslations)) {
         if (!entry?.ids?.includes(stat.id)) continue;
 
         for (const block of entry.English || []) {
           for (const str of block.string || []) {
-            const norm = normalize(str);
-            if (!MOD_INDEX[norm]) {
-              MOD_INDEX[norm] = { mod, stat };
+            const key = normalize(str);
+
+            if (!MOD_INDEX[key]) {
+              MOD_INDEX[key] = {
+                mod,
+                statIndex: i
+              };
             }
           }
         }
@@ -50,28 +52,23 @@ function buildIndex() {
 
 buildIndex();
 
-/**
- * ⚡ FAST LOOKUP
- */
 function findModByText(text) {
   const key = normalize(text);
 
   if (MOD_INDEX[key]) {
     return {
       mod: MOD_INDEX[key].mod,
-      statIndex: 0,
+      statIndex: MOD_INDEX[key].statIndex,
       score: 100
     };
   }
 
-  // fallback (light fuzzy, NOT full scan)
-  const keys = Object.keys(MOD_INDEX);
-
-  for (const k of keys) {
+  // fallback fuzzy (light only)
+  for (const k in MOD_INDEX) {
     if (k.includes(key) || key.includes(k)) {
       return {
         mod: MOD_INDEX[k].mod,
-        statIndex: 0,
+        statIndex: MOD_INDEX[k].statIndex,
         score: 60
       };
     }
@@ -83,7 +80,8 @@ function findModByText(text) {
 function getTierRange(found, tierIndex = 0) {
   if (!found?.mod?.stats) return null;
 
-  const stat = found.mod.stats[0];
+  const stat = found.mod.stats[found.statIndex];
+
   if (!stat?.min || !stat?.max) return null;
 
   return {
