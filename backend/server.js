@@ -7,6 +7,7 @@ const { findModByText, getTierRange } = require("./modMapper");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const DEFAULT_TRADE_LEAGUE = process.env.TRADE_LEAGUE || "Mirage";
 
 const allowedOrigins = [
   "https://poe-trade-app.vercel.app",
@@ -31,9 +32,16 @@ app.use(express.json());
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    message: "PoE Trade backend is live"
+    message: "PoE Trade backend is live",
+    defaultTradeLeague: DEFAULT_TRADE_LEAGUE
   });
 });
+
+function sanitizeLeagueName(league) {
+  const cleaned = String(league || "").trim();
+  if (!cleaned) return DEFAULT_TRADE_LEAGUE;
+  return cleaned;
+}
 
 function extractPobbId(url) {
   const clean = url.trim().replace(/\/+$/, "");
@@ -115,6 +123,30 @@ function extractItemText(item) {
   return "";
 }
 
+function extractItemName(item, fallbackIndex) {
+  if (item?.$?.Name) return item.$.Name;
+  if (item?.$?.name) return item.$.name;
+
+  const text = extractItemText(item);
+  if (!text) return `Item ${fallbackIndex + 1}`;
+
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines[0]?.startsWith("Rarity:")) {
+    if (lines[1] && lines[2]) {
+      return `${lines[1]} ${lines[2]}`;
+    }
+    if (lines[1]) {
+      return lines[1];
+    }
+  }
+
+  return lines[0] || `Item ${fallbackIndex + 1}`;
+}
+
 function parseModsFromItemText(itemText) {
   if (!itemText) return [];
 
@@ -142,7 +174,7 @@ function parseModsFromItemText(itemText) {
     }
 
     if (
-      line.includes("Rarity:") ||
+      line.startsWith("Rarity:") ||
       line === "Corrupted" ||
       line === "Unidentified" ||
       line.startsWith("Note:")
@@ -165,7 +197,19 @@ function parseModsFromItemText(itemText) {
       line.includes("increased ") ||
       line.includes("reduced ") ||
       line.includes("more ") ||
-      line.includes("less ")
+      line.includes("less ") ||
+      line.includes("Chaos") ||
+      line.includes("Cold") ||
+      line.includes("Fire") ||
+      line.includes("Lightning") ||
+      line.includes("Life") ||
+      line.includes("Mana") ||
+      line.includes("Resistance") ||
+      line.includes("Armour") ||
+      line.includes("Evasion") ||
+      line.includes("Energy Shield") ||
+      line.includes("Spell Suppression") ||
+      line.includes("Movement Speed")
     ) {
       reachedMods = true;
     }
@@ -179,30 +223,6 @@ function parseModsFromItemText(itemText) {
   }
 
   return mods;
-}
-
-function extractItemName(item, fallbackIndex) {
-  if (item?.$?.Name) return item.$.Name;
-  if (item?.$?.name) return item.$.name;
-
-  const text = extractItemText(item);
-  if (!text) return `Item ${fallbackIndex + 1}`;
-
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  if (lines[0]?.startsWith("Rarity:")) {
-    if (lines[1] && lines[2]) {
-      return `${lines[1]} ${lines[2]}`;
-    }
-    if (lines[1]) {
-      return lines[1];
-    }
-  }
-
-  return lines[0] || `Item ${fallbackIndex + 1}`;
 }
 
 function normalizeItemsFromXml(result) {
@@ -286,19 +306,21 @@ function buildTradeQuery(item) {
   };
 }
 
-function generateTradeLink(query) {
+function generateTradeLink(query, league) {
   const encoded = encodeURIComponent(JSON.stringify(query));
-  return `https://www.pathofexile.com/trade/search/Settlers?q=${encoded}`;
+  const finalLeague = encodeURIComponent(sanitizeLeagueName(league));
+  return `https://www.pathofexile.com/trade/search/${finalLeague}?q=${encoded}`;
 }
 
 app.post("/generate", async (req, res) => {
   try {
-    const { input } = req.body;
+    const { input, league } = req.body;
 
     if (!input || !input.trim()) {
       return res.status(400).json({ error: "No PoB input provided." });
     }
 
+    const selectedLeague = sanitizeLeagueName(league);
     const items = await parsePoB(input);
 
     console.log("Parsed items preview:");
@@ -315,7 +337,7 @@ app.post("/generate", async (req, res) => {
 
       return {
         item: item.name,
-        link: generateTradeLink(built.query),
+        link: generateTradeLink(built.query, selectedLeague),
         matchedMods: built.matchedMods,
         totalMods: item.mods.length,
         upgradeScore:
@@ -327,7 +349,10 @@ app.post("/generate", async (req, res) => {
 
     results.sort((a, b) => b.upgradeScore - a.upgradeScore);
 
-    return res.json(results);
+    return res.json({
+      league: selectedLeague,
+      results
+    });
   } catch (err) {
     console.error("Generate Error:", err.message);
     return res.status(500).json({

@@ -3,9 +3,11 @@ import axios from "axios";
 
 export default function App() {
   const [input, setInput] = useState("");
+  const [league, setLeague] = useState("Mirage");
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [returnedLeague, setReturnedLeague] = useState("");
 
   const API_URL = import.meta.env.VITE_REACT_APP_API;
 
@@ -23,12 +25,21 @@ export default function App() {
     setLoading(true);
     setError("");
     setResults([]);
+    setReturnedLeague("");
 
     try {
-      const res = await axios.post(`${API_URL}/generate`, { input });
+      const res = await axios.post(`${API_URL}/generate`, {
+        input,
+        league
+      });
 
-      if (Array.isArray(res.data) && res.data.length > 0) {
-        setResults(res.data);
+      if (res.data && Array.isArray(res.data.results) && res.data.results.length > 0) {
+        setResults(res.data.results);
+        setReturnedLeague(res.data.league || league);
+      } else if (res.data && Array.isArray(res.data.results) && res.data.results.length === 0) {
+        setResults([]);
+        setReturnedLeague(res.data.league || league);
+        setError("No items found or no usable mods were matched.");
       } else {
         setError("No items found or invalid PoB data.");
       }
@@ -46,6 +57,14 @@ export default function App() {
     }
   };
 
+  const leagueOptions = [
+    "Mirage",
+    "Standard",
+    "Hardcore",
+    "Solo Self-Found",
+    "Hardcore Solo Self-Found"
+  ];
+
   return (
     <div
       style={{
@@ -60,6 +79,28 @@ export default function App() {
       <p>
         Paste a Path of Building XML export, a pobb.in link, or a Pastebin link.
       </p>
+
+      <div style={{ marginBottom: 16 }}>
+        <label htmlFor="league-select" style={{ display: "block", marginBottom: 8 }}>
+          Trade League
+        </label>
+        <select
+          id="league-select"
+          value={league}
+          onChange={(e) => setLeague(e.target.value)}
+          style={{
+            padding: 10,
+            fontSize: 14,
+            minWidth: 280
+          }}
+        >
+          {leagueOptions.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
+      </div>
 
       <textarea
         rows={14}
@@ -89,6 +130,12 @@ export default function App() {
       >
         {loading ? "Generating..." : "Generate Links"}
       </button>
+
+      {returnedLeague && !error && (
+        <p style={{ marginTop: 16 }}>
+          <strong>Using trade league:</strong> {returnedLeague}
+        </p>
+      )}
 
       {error && (
         <div
