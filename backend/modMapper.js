@@ -242,8 +242,8 @@ function dedupeMatches(matches) {
 
 function selectBestFilters(matches) {
   const caps = {
-    total: 5,
-    explicit: 4,
+    total: 4,
+    explicit: 3,
     implicit: 1,
     enchant: 1
   };
@@ -357,8 +357,6 @@ function mapModsToTradeFilters(mods) {
 
 function buildTradeStats(filters) {
   const valid = (filters || []).filter((f) => isValidTradeStatId(f.id));
-
-  if (!valid.length) return [];
 
   return [
     {

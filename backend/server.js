@@ -17,7 +17,8 @@ const DEFAULT_TRADE_LEAGUE = process.env.TRADE_LEAGUE || "Mirage";
 
 const MAX_ITEMS_TO_PROCESS = 8;
 const MAX_MODS_PER_ITEM = 10;
-const MAX_PRICE_CHECKS = 2;
+const SEARCH_DELAY_MS = 350;
+const MAX_SEARCH_RETRIES = 2;
 
 app.use(cors());
 app.use(express.json());
@@ -36,6 +37,10 @@ app.get("/", (req, res) => {
     tradeStats: getTradeStatsStatus()
   });
 });
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function sanitizeLeagueName(league) {
   const cleaned = String(league || "").trim();
@@ -360,8 +365,20 @@ function extractItemMeta(item, fallbackIndex) {
     searchType = lines[2] || "";
     displayName = [rareName, searchType].filter(Boolean).join(" ") || rareName || searchType || displayName;
   } else if (rarity === "Magic") {
-    searchType = lines[1] || "";
-    displayName = searchType || displayName;
+    // Magic items may have either:
+    // lines[1] = full magic name
+    // lines[2] = base type
+    // If base type exists, prefer it for trade type.
+    const magicName = lines[1] || "";
+    const maybeBase = lines[2] || "";
+
+    if (maybeBase) {
+      searchType = maybeBase;
+      displayName = [magicName, maybeBase].filter(Boolean).join(" ");
+    } else {
+      searchType = magicName;
+      displayName = magicName || displayName;
+    }
   } else {
     searchType = lines[1] || lines[0] || "";
     displayName = searchType || displayName;
@@ -412,11 +429,20 @@ async function parsePoB(input) {
   return normalizeItemsFromXml(result);
 }
 
+function buildEmptyStatsGroup() {
+  return [
+    {
+      type: "and",
+      filters: []
+    }
+  ];
+}
+
 function buildFallbackQuery(item) {
   const query = {
     query: {
       status: { option: "online" },
-      stats: []
+      stats: buildEmptyStatsGroup()
     },
     sort: { price: "asc" }
   };
@@ -436,9 +462,7 @@ function buildStrictCandidateQuery(item) {
   const validStrictFilters = mapped.filters.filter((f) => isValidTradeStatId(f.id));
 
   const strictQuery = buildFallbackQuery(item);
-  if (validStrictFilters.length > 0) {
-    strictQuery.query.stats = buildTradeStats(validStrictFilters);
-  }
+  strictQuery.query.stats = buildTradeStats(validStrictFilters);
 
   return {
     query: strictQuery,
@@ -458,15 +482,42 @@ async function submitTradeSearch(queryObject, league) {
     sanitizeLeagueName(league)
   )}`;
 
-  const res = await axios.post(searchUrl, queryObject, {
-    headers: POE_HEADERS,
-    validateStatus: () => true,
-    timeout: 12000
-  });
+  let attempt = 0;
+  let lastRes = null;
+
+  while (attempt <= MAX_SEARCH_RETRIES) {
+    if (attempt > 0) {
+      await sleep(600 * attempt);
+    }
+
+    const res = await axios.post(searchUrl, queryObject, {
+      headers: POE_HEADERS,
+      validateStatus: () => true,
+      timeout: 12000
+    });
+
+    lastRes = res;
+
+    if (res.status !== 429) {
+      return {
+        status: res.status,
+        data: res.data
+      };
+    }
+
+    const retryAfter = Number(res.headers["retry-after"]);
+    if (Number.isFinite(retryAfter) && retryAfter > 0) {
+      await sleep(retryAfter * 1000);
+    } else {
+      await sleep(1200 * (attempt + 1));
+    }
+
+    attempt += 1;
+  }
 
   return {
-    status: res.status,
-    data: res.data
+    status: lastRes?.status || 429,
+    data: lastRes?.data || null
   };
 }
 
@@ -505,6 +556,8 @@ async function resolveTradeQuery(item, league) {
         fallbackStatus: null
       };
     }
+
+    await sleep(SEARCH_DELAY_MS);
   }
 
   fallbackAttempt = await submitTradeSearch(fallbackQuery, league);
@@ -547,18 +600,6 @@ async function resolveTradeQuery(item, league) {
     strictStatus: strictAttempt ? strictAttempt.status : null,
     fallbackStatus: fallbackAttempt ? fallbackAttempt.status : null
   };
-}
-
-async function estimatePriceBySearchId(searchId) {
-  try {
-    if (!searchId) return null;
-
-    return {
-      searchId
-    };
-  } catch {
-    return null;
-  }
 }
 
 app.post("/generate", async (req, res) => {
@@ -646,6 +687,8 @@ app.post("/generate", async (req, res) => {
         fallbackStatus: resolved.fallbackStatus,
         tradeQuery: resolved.chosenQuery
       });
+
+      await sleep(SEARCH_DELAY_MS);
     }
 
     console.log("END /generate", {
