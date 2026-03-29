@@ -77,10 +77,7 @@ function findModByText(text) {
       const stat = mod.stats[i];
       if (!stat?.id) continue;
 
-      const candidates = [
-        stat.id,
-        ...collectTranslationStrings(stat.id)
-      ];
+      const candidates = [stat.id, ...collectTranslationStrings(stat.id)];
 
       for (const c of candidates) {
         const norm = normalizeText(c);
@@ -112,10 +109,7 @@ function getTierRange(found, tierIndex = 0) {
   const stat = found.mod.stats[found.statIndex];
   if (!stat?.min || !stat?.max) return null;
 
-  const i = Math.max(
-    0,
-    Math.min(tierIndex, stat.min.length - 1)
-  );
+  const i = Math.max(0, Math.min(tierIndex, stat.min.length - 1));
 
   return {
     statId: stat.id,
