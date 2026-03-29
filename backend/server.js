@@ -11,8 +11,8 @@ const DEFAULT_TRADE_LEAGUE = process.env.TRADE_LEAGUE || "Mirage";
 
 const MAX_ITEMS_TO_PROCESS = 8;
 const MAX_MODS_PER_ITEM = 10;
-const MAX_BUILD_QUERY_MS = 2500;
-const MAX_PRICE_CHECKS = 3;
+const MAX_BUILD_QUERY_MS = 1500;
+const MAX_PRICE_CHECKS = 2;
 
 app.use(cors());
 app.use(express.json());
@@ -108,30 +108,6 @@ function extractItemText(item) {
   return "";
 }
 
-function extractItemName(item, fallbackIndex) {
-  if (item?.$?.Name) return item.$.Name;
-  if (item?.$?.name) return item.$.name;
-
-  const text = extractItemText(item);
-  if (!text) return `Item ${fallbackIndex + 1}`;
-
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  if (lines[0]?.startsWith("Rarity:")) {
-    if (lines[1] && lines[2]) {
-      return `${lines[1]} ${lines[2]}`;
-    }
-    if (lines[1]) {
-      return lines[1];
-    }
-  }
-
-  return lines[0] || `Item ${fallbackIndex + 1}`;
-}
-
 function stripPobTags(text) {
   return String(text || "")
     .replace(/\{[^}]*\}/g, "")
@@ -192,6 +168,27 @@ function decodeClusterInternalMod(line) {
   return null;
 }
 
+function shouldSkipModLine(line) {
+  const lower = stripPobTags(line).toLowerCase();
+
+  return (
+    lower.includes("adds # passive skills") ||
+    lower.includes("passive skills are jewel sockets") ||
+    lower.includes("allocates ") ||
+    lower.includes("selection:") ||
+    lower.includes("catalystquality") ||
+    lower.includes("basepercentile") ||
+    lower.includes("armourbasepercentile") ||
+    lower.includes("evasionbasepercentile") ||
+    lower.includes("energyshieldbasepercentile") ||
+    /^quality:/.test(lower) ||
+    /^armour:\s*\d+$/.test(lower) ||
+    /^evasion:\s*\d+$/.test(lower) ||
+    /^energy shield:\s*\d+$/.test(lower) ||
+    /^ward:\s*\d+$/.test(lower)
+  );
+}
+
 function classifyMod(line) {
   const raw = normalizeSpaces(line);
   const noTags = normalizeSpaces(stripPobTags(line));
@@ -231,27 +228,6 @@ function classifyMod(line) {
     text: noTags,
     kind: "explicit"
   };
-}
-
-function shouldSkipModLine(line) {
-  const lower = stripPobTags(line).toLowerCase();
-
-  return (
-    lower.includes("adds # passive skills") ||
-    lower.includes("passive skills are jewel sockets") ||
-    lower.includes("allocates ") ||
-    lower.includes("selection:") ||
-    lower.includes("catalystquality") ||
-    lower.includes("basepercentile") ||
-    lower.includes("armourbasepercentile") ||
-    lower.includes("evasionbasepercentile") ||
-    lower.includes("energyshieldbasepercentile") ||
-    /^quality:/.test(lower) ||
-    /^armour:\s*\d+$/.test(lower) ||
-    /^evasion:\s*\d+$/.test(lower) ||
-    /^energy shield:\s*\d+$/.test(lower) ||
-    /^ward:\s*\d+$/.test(lower)
-  );
 }
 
 function parseModsFromItemText(itemText) {
@@ -337,6 +313,54 @@ function parseModsFromItemText(itemText) {
   return mods;
 }
 
+function extractItemMeta(item, fallbackIndex) {
+  const text = extractItemText(item);
+
+  if (!text) {
+    return {
+      rarity: "Unknown",
+      displayName: `Item ${fallbackIndex + 1}`,
+      searchName: "",
+      searchType: ""
+    };
+  }
+
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const rarityLine = lines.find((line) => line.startsWith("Rarity:"));
+  const rarity = rarityLine ? rarityLine.replace("Rarity:", "").trim() : "Unknown";
+
+  let searchName = "";
+  let searchType = "";
+  let displayName = `Item ${fallbackIndex + 1}`;
+
+  if (rarity === "Unique") {
+    searchName = lines[1] || "";
+    searchType = lines[2] || "";
+    displayName = [searchName, searchType].filter(Boolean).join(" ") || searchName || searchType || displayName;
+  } else if (rarity === "Rare") {
+    const rareName = lines[1] || "";
+    searchType = lines[2] || "";
+    displayName = [rareName, searchType].filter(Boolean).join(" ") || rareName || searchType || displayName;
+  } else if (rarity === "Magic") {
+    searchType = lines[1] || "";
+    displayName = searchType || displayName;
+  } else {
+    searchType = lines[1] || lines[0] || "";
+    displayName = searchType || displayName;
+  }
+
+  return {
+    rarity,
+    displayName,
+    searchName,
+    searchType
+  };
+}
+
 function normalizeItemsFromXml(result) {
   const itemsNode =
     result?.PathOfBuilding?.Build?.[0]?.Items?.[0]?.Item ||
@@ -348,10 +372,16 @@ function normalizeItemsFromXml(result) {
 
   return itemsNode.map((item, index) => {
     const itemText = extractItemText(item);
-    const name = extractItemName(item, index);
+    const meta = extractItemMeta(item, index);
     const mods = parseModsFromItemText(itemText);
 
-    return { name, mods };
+    return {
+      rarity: meta.rarity,
+      displayName: meta.displayName,
+      searchName: meta.searchName,
+      searchType: meta.searchType,
+      mods
+    };
   });
 }
 
@@ -373,16 +403,6 @@ function normalizeTierIndex(tier) {
   const match = tier.match(/^T(\d+)$/i);
   if (!match) return 0;
   return Math.max(parseInt(match[1], 10) - 1, 0);
-}
-
-function buildNameOnlyQuery(item) {
-  return {
-    query: {
-      status: { option: "online" },
-      name: item.name,
-      stats: []
-    }
-  };
 }
 
 function isValidFilter(filter) {
@@ -412,6 +432,24 @@ function dedupeFilters(filters) {
   return out;
 }
 
+function buildFallbackQuery(item) {
+  const base = {
+    query: {
+      status: { option: "online" },
+      stats: []
+    }
+  };
+
+  if (item.rarity === "Unique" && item.searchName) {
+    base.query.name = item.searchName;
+    if (item.searchType) base.query.type = item.searchType;
+  } else if (item.searchType) {
+    base.query.type = item.searchType;
+  }
+
+  return base;
+}
+
 function buildSafeTradeQuery(item) {
   const started = Date.now();
 
@@ -425,7 +463,7 @@ function buildSafeTradeQuery(item) {
 
   for (const mod of item.mods.slice(0, MAX_MODS_PER_ITEM)) {
     if (Date.now() - started > MAX_BUILD_QUERY_MS) {
-      console.warn("buildTradeQuery timeout", { item: item.name });
+      console.warn("buildTradeQuery timeout", { item: item.displayName });
       break;
     }
 
@@ -482,19 +520,18 @@ function buildSafeTradeQuery(item) {
     ...enchantFilters
   ]).filter(isValidFilter);
 
-  const stats = allFilters.length
-    ? [{ type: "and", filters: allFilters }]
-    : [];
+  const strictQuery = buildFallbackQuery(item);
 
-  const strictQuery = {
-    query: {
-      status: { option: "online" },
-      name: item.name,
-      stats
-    }
-  };
+  if (allFilters.length) {
+    strictQuery.query.stats = [
+      {
+        type: "and",
+        filters: allFilters
+      }
+    ];
+  }
 
-  const fallbackQuery = buildNameOnlyQuery(item);
+  const fallbackQuery = buildFallbackQuery(item);
 
   return {
     matchedMods,
@@ -594,7 +631,6 @@ app.post("/generate", async (req, res) => {
     }
 
     const selectedLeague = sanitizeLeagueName(league);
-    console.log("League selected:", selectedLeague, "elapsed", Date.now() - started, "ms");
 
     const parsedItems = await parsePoB(input);
     console.log("parsePoB done", {
@@ -620,41 +656,30 @@ app.post("/generate", async (req, res) => {
       const built = buildSafeTradeQuery(item);
 
       console.log("buildTradeQuery done", {
-        item: item.name,
+        item: item.displayName,
         matchedMods: built.matchedMods,
         totalMods: built.totalMods,
         ms: Date.now() - t0,
         useStrict: built.useStrict
       });
 
-      builtResults.push({
-        item: item.name,
-        built
-      });
+      builtResults.push({ item, built });
     }
 
-    const usableResults = builtResults.filter(
-      (r) => r.built.useStrict || r.item
-    );
-
     const finalResults = await Promise.all(
-      usableResults.map(async (entry, index) => {
-        const chosenQuery = entry.built.useStrict
-          ? entry.built.strictQuery
-          : entry.built.fallbackQuery;
+      builtResults.map(async (entry, index) => {
+        const chosenQuery = entry.built.fallbackQuery;
 
         let priceEstimate = null;
         if (estimatePrices && index < MAX_PRICE_CHECKS) {
-          const p0 = Date.now();
           priceEstimate = await estimatePrice(chosenQuery, selectedLeague);
-          console.log("estimatePrice done", {
-            item: entry.item,
-            ms: Date.now() - p0
-          });
         }
 
         return {
-          item: entry.item,
+          item: entry.item.displayName,
+          rarity: entry.item.rarity,
+          searchName: entry.item.searchName,
+          searchType: entry.item.searchType,
           link: generateTradeLink(chosenQuery, selectedLeague),
           matchedMods: entry.built.matchedMods,
           totalMods: entry.built.totalMods,
@@ -664,18 +689,11 @@ app.post("/generate", async (req, res) => {
               : 0,
           matchedDetails: entry.built.matchedDetails,
           unmatchedMods: entry.built.unmatchedMods,
-          queryMode: entry.built.useStrict ? "strict" : "fallback",
+          queryMode: "fallback",
           priceEstimate
         };
       })
     );
-
-    finalResults.sort((a, b) => {
-      if (b.upgradeScore !== a.upgradeScore) {
-        return b.upgradeScore - a.upgradeScore;
-      }
-      return a.queryMode.localeCompare(b.queryMode);
-    });
 
     console.log("END /generate", {
       totalMs: Date.now() - started,
