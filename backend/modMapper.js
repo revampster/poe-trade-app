@@ -1,59 +1,62 @@
 const modsData = require("./repoe_data/mods.json");
 
-function normalizeText(text) {
+function cleanModText(text) {
   return String(text || "")
     .toLowerCase()
-    .replace(/[+#%]/g, "")
-    .replace(/\([^)]*\)/g, "")
-    .replace(/\d+/g, "#")
+    .replace(/\{[^}]*\}/g, "") // remove {crafted}, {range}, etc
+    .replace(/\([^)]*\)/g, "") // remove (12-20)
+    .replace(/\d+/g, "#") // normalize numbers
+    .replace(/[+%]/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function scoreMatch(a, b) {
+function similarity(a, b) {
   if (!a || !b) return 0;
-  if (a === b) return 100;
-  if (a.includes(b) || b.includes(a)) return 75;
 
-  const aWords = new Set(a.split(" "));
-  const bWords = new Set(b.split(" "));
-  let overlap = 0;
+  if (a === b) return 100;
+
+  if (a.includes(b) || b.includes(a)) return 50;
+
+  const aWords = a.split(" ");
+  const bWords = b.split(" ");
+
+  let score = 0;
 
   for (const word of aWords) {
-    if (bWords.has(word)) overlap++;
+    if (bWords.includes(word)) score++;
   }
 
-  return overlap;
+  return score;
 }
 
 function findModByText(text) {
-  const needle = normalizeText(text);
-  let bestMod = null;
+  const cleaned = cleanModText(text);
+
+  let best = null;
   let bestScore = 0;
 
   for (const mod of Object.values(modsData)) {
-    if (!mod?.stats || !Array.isArray(mod.stats) || mod.stats.length === 0) {
-      continue;
-    }
+    if (!mod.stats || !Array.isArray(mod.stats)) continue;
 
     for (const stat of mod.stats) {
-      if (!stat?.id) continue;
+      if (!stat.id) continue;
 
-      const statText = normalizeText(stat.id);
-      const score = scoreMatch(needle, statText);
+      const statText = cleanModText(stat.id);
+
+      const score = similarity(cleaned, statText);
 
       if (score > bestScore) {
         bestScore = score;
-        bestMod = mod;
+        best = mod;
       }
     }
   }
 
-  if (bestScore < 2) {
-    return null;
-  }
+  // require minimum match strength
+  if (bestScore < 2) return null;
 
-  return bestMod;
+  return best;
 }
 
 function getTierRange(mod, tierIndex = 0) {
