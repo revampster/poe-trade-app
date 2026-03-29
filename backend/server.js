@@ -22,6 +22,12 @@ const MAX_PRICE_CHECKS = 2;
 app.use(cors());
 app.use(express.json());
 
+const POE_HEADERS = {
+  "User-Agent": "poe-trade-app/1.0",
+  "Content-Type": "application/json",
+  Accept: "application/json"
+};
+
 app.get("/", (req, res) => {
   res.json({
     ok: true,
@@ -425,110 +431,130 @@ function buildFallbackQuery(item) {
   return query;
 }
 
-function buildSafeTradeQuery(item) {
+function buildStrictCandidateQuery(item) {
   const mapped = mapModsToTradeFilters(item.mods.slice(0, MAX_MODS_PER_ITEM));
-
   const validStrictFilters = mapped.filters.filter((f) => isValidTradeStatId(f.id));
 
-  const fallbackQuery = buildFallbackQuery(item);
   const strictQuery = buildFallbackQuery(item);
-
   if (validStrictFilters.length > 0) {
     strictQuery.query.stats = buildTradeStats(validStrictFilters);
   }
 
-  const useStrict = validStrictFilters.length > 0;
-  const chosenQuery = useStrict ? strictQuery : fallbackQuery;
-
   return {
-    matchedMods: mapped.debug.selected.length,
-    totalMods: item.mods.length,
+    query: strictQuery,
     matchedFilters: validStrictFilters,
     matchedDetails: mapped.debug.selected.filter((m) => isValidTradeStatId(m.id)),
     allMatchedMods: mapped.debug.allMatches,
     unmatchedMods: mapped.debug.unmatched,
-    strictQuery,
-    fallbackQuery,
-    chosenQuery,
-    useStrict,
-    tradeStatsReady: mapped.debug.tradeStatsReady
+    matchedMods: mapped.debug.selected.length,
+    totalMods: item.mods.length,
+    tradeStatsReady: mapped.debug.tradeStatsReady,
+    canTryStrict: validStrictFilters.length > 0
   };
 }
 
-function generateTradeLink(query, league) {
-  const encoded = encodeURIComponent(JSON.stringify(query));
-  const finalLeague = encodeURIComponent(sanitizeLeagueName(league));
-  return `https://www.pathofexile.com/trade/search/${finalLeague}?q=${encoded}`;
+async function submitTradeSearch(queryObject, league) {
+  const searchUrl = `https://www.pathofexile.com/api/trade/search/${encodeURIComponent(
+    sanitizeLeagueName(league)
+  )}`;
+
+  const res = await axios.post(searchUrl, queryObject, {
+    headers: POE_HEADERS,
+    validateStatus: () => true,
+    timeout: 12000
+  });
+
+  return {
+    status: res.status,
+    data: res.data
+  };
 }
 
-const POE_HEADERS = {
-  "User-Agent": "poe-trade-app/1.0",
-  "Content-Type": "application/json"
-};
+function buildTradeResultLink(league, searchId) {
+  const finalLeague = encodeURIComponent(sanitizeLeagueName(league));
+  return `https://www.pathofexile.com/trade/search/${finalLeague}/${encodeURIComponent(searchId)}`;
+}
 
-async function estimatePrice(tradeQuery, league) {
+async function resolveTradeQuery(item, league) {
+  const fallbackQuery = buildFallbackQuery(item);
+  const strictCandidate = buildStrictCandidateQuery(item);
+
+  let strictAttempt = null;
+  let fallbackAttempt = null;
+
+  if (strictCandidate.canTryStrict) {
+    strictAttempt = await submitTradeSearch(strictCandidate.query, league);
+    const strictId = strictAttempt?.data?.id;
+
+    if (strictAttempt.status === 200 && strictId) {
+      return {
+        chosenQuery: strictCandidate.query,
+        queryMode: "strict",
+        link: buildTradeResultLink(league, strictId),
+        searchId: strictId,
+        strictAccepted: true,
+        fallbackAccepted: false,
+        matchedMods: strictCandidate.matchedMods,
+        totalMods: strictCandidate.totalMods,
+        matchedFilters: strictCandidate.matchedFilters,
+        matchedDetails: strictCandidate.matchedDetails,
+        allMatchedMods: strictCandidate.allMatchedMods,
+        unmatchedMods: strictCandidate.unmatchedMods,
+        tradeStatsReady: strictCandidate.tradeStatsReady,
+        strictStatus: strictAttempt.status,
+        fallbackStatus: null
+      };
+    }
+  }
+
+  fallbackAttempt = await submitTradeSearch(fallbackQuery, league);
+  const fallbackId = fallbackAttempt?.data?.id;
+
+  if (fallbackAttempt.status === 200 && fallbackId) {
+    return {
+      chosenQuery: fallbackQuery,
+      queryMode: "fallback",
+      link: buildTradeResultLink(league, fallbackId),
+      searchId: fallbackId,
+      strictAccepted: false,
+      fallbackAccepted: true,
+      matchedMods: strictCandidate.matchedMods,
+      totalMods: strictCandidate.totalMods,
+      matchedFilters: strictCandidate.matchedFilters,
+      matchedDetails: strictCandidate.matchedDetails,
+      allMatchedMods: strictCandidate.allMatchedMods,
+      unmatchedMods: strictCandidate.unmatchedMods,
+      tradeStatsReady: strictCandidate.tradeStatsReady,
+      strictStatus: strictAttempt ? strictAttempt.status : null,
+      fallbackStatus: fallbackAttempt.status
+    };
+  }
+
+  return {
+    chosenQuery: fallbackQuery,
+    queryMode: "failed",
+    link: null,
+    searchId: null,
+    strictAccepted: false,
+    fallbackAccepted: false,
+    matchedMods: strictCandidate.matchedMods,
+    totalMods: strictCandidate.totalMods,
+    matchedFilters: strictCandidate.matchedFilters,
+    matchedDetails: strictCandidate.matchedDetails,
+    allMatchedMods: strictCandidate.allMatchedMods,
+    unmatchedMods: strictCandidate.unmatchedMods,
+    tradeStatsReady: strictCandidate.tradeStatsReady,
+    strictStatus: strictAttempt ? strictAttempt.status : null,
+    fallbackStatus: fallbackAttempt ? fallbackAttempt.status : null
+  };
+}
+
+async function estimatePriceBySearchId(searchId) {
   try {
-    const searchUrl = `https://www.pathofexile.com/api/trade/search/${encodeURIComponent(
-      sanitizeLeagueName(league)
-    )}`;
-
-    const payload = tradeQuery;
-
-    const searchRes = await axios.post(searchUrl, payload, {
-      headers: POE_HEADERS,
-      validateStatus: () => true,
-      timeout: 8000
-    });
-
-    if (searchRes.status !== 200 || !searchRes.data?.id || !Array.isArray(searchRes.data?.result)) {
-      return null;
-    }
-
-    const ids = searchRes.data.result.slice(0, 10);
-
-    if (!ids.length) {
-      return {
-        totalListed: 0,
-        cheapest: null,
-        examples: []
-      };
-    }
-
-    const fetchUrl =
-      `https://www.pathofexile.com/api/trade/fetch/${ids.join(",")}` +
-      `?query=${encodeURIComponent(searchRes.data.id)}`;
-
-    const fetchRes = await axios.get(fetchUrl, {
-      headers: POE_HEADERS,
-      validateStatus: () => true,
-      timeout: 8000
-    });
-
-    if (fetchRes.status !== 200 || !Array.isArray(fetchRes.data?.result)) {
-      return {
-        totalListed: searchRes.data.total ?? ids.length,
-        cheapest: null,
-        examples: []
-      };
-    }
-
-    const examples = fetchRes.data.result
-      .map((entry) => {
-        const price = entry?.listing?.price;
-        if (!price) return null;
-
-        return {
-          amount: price.amount ?? null,
-          currency: price.currency ?? null,
-          account: entry?.listing?.account?.name ?? null
-        };
-      })
-      .filter(Boolean);
+    if (!searchId) return null;
 
     return {
-      totalListed: searchRes.data.total ?? ids.length,
-      cheapest: examples[0] || null,
-      examples: examples.slice(0, 3)
+      searchId
     };
   } catch {
     return null;
@@ -541,10 +567,9 @@ app.post("/generate", async (req, res) => {
   try {
     await initTradeStats();
 
-    const { input, league, estimatePrices = false } = req.body;
+    const { input, league } = req.body;
 
     console.log("START /generate", {
-      estimatePrices,
       league,
       hasInput: !!input,
       tradeStats: getTradeStatsStatus()
@@ -574,19 +599,21 @@ app.post("/generate", async (req, res) => {
       maxModsPerItem: MAX_MODS_PER_ITEM
     });
 
-    const builtResults = [];
+    const finalResults = [];
+
     for (const item of items) {
       const t0 = Date.now();
-      const built = buildSafeTradeQuery(item);
+      const resolved = await resolveTradeQuery(item, selectedLeague);
 
       console.log("buildTradeQuery done", {
         item: item.displayName,
-        matchedMods: built.matchedMods,
-        totalMods: built.totalMods,
+        matchedMods: resolved.matchedMods,
+        totalMods: resolved.totalMods,
         ms: Date.now() - t0,
-        useStrict: built.useStrict,
-        tradeStatsReady: built.tradeStatsReady,
-        matchedFilters: built.matchedDetails.map((m) => ({
+        queryMode: resolved.queryMode,
+        strictStatus: resolved.strictStatus,
+        fallbackStatus: resolved.fallbackStatus,
+        matchedFilters: resolved.matchedDetails.map((m) => ({
           mod: m.mod,
           id: m.id,
           score: m.score,
@@ -594,44 +621,32 @@ app.post("/generate", async (req, res) => {
         }))
       });
 
-      builtResults.push({ item, built });
+      finalResults.push({
+        item: item.displayName,
+        rarity: item.rarity,
+        searchName: item.searchName,
+        searchType: item.searchType,
+        link: resolved.link,
+        searchId: resolved.searchId,
+        matchedMods: resolved.matchedMods,
+        totalMods: resolved.totalMods,
+        upgradeScore:
+          resolved.totalMods > 0
+            ? Math.round((resolved.matchedMods / resolved.totalMods) * 100)
+            : 0,
+        matchedFilters: resolved.matchedFilters,
+        matchedDetails: resolved.matchedDetails,
+        allMatchedMods: resolved.allMatchedMods,
+        unmatchedMods: resolved.unmatchedMods,
+        queryMode: resolved.queryMode,
+        strictAccepted: resolved.strictAccepted,
+        fallbackAccepted: resolved.fallbackAccepted,
+        tradeStatsReady: resolved.tradeStatsReady,
+        strictStatus: resolved.strictStatus,
+        fallbackStatus: resolved.fallbackStatus,
+        tradeQuery: resolved.chosenQuery
+      });
     }
-
-    const finalResults = await Promise.all(
-      builtResults.map(async (entry, index) => {
-        const chosenQuery = entry.built.chosenQuery;
-        const queryMode = entry.built.useStrict ? "strict" : "fallback";
-
-        let priceEstimate = null;
-        if (estimatePrices && index < MAX_PRICE_CHECKS) {
-          priceEstimate = await estimatePrice(chosenQuery, selectedLeague);
-        }
-
-        return {
-          item: entry.item.displayName,
-          rarity: entry.item.rarity,
-          searchName: entry.item.searchName,
-          searchType: entry.item.searchType,
-          link: generateTradeLink(chosenQuery, selectedLeague),
-          matchedMods: entry.built.matchedMods,
-          totalMods: entry.built.totalMods,
-          upgradeScore:
-            entry.built.totalMods > 0
-              ? Math.round((entry.built.matchedMods / entry.built.totalMods) * 100)
-              : 0,
-          matchedFilters: entry.built.matchedFilters,
-          matchedDetails: entry.built.matchedDetails,
-          allMatchedMods: entry.built.allMatchedMods,
-          unmatchedMods: entry.built.unmatchedMods,
-          queryMode,
-          tradeStatsReady: entry.built.tradeStatsReady,
-          tradeQuery: chosenQuery,
-          strictTradeQuery: entry.built.strictQuery,
-          fallbackTradeQuery: entry.built.fallbackQuery,
-          priceEstimate
-        };
-      })
-    );
 
     console.log("END /generate", {
       totalMs: Date.now() - started,

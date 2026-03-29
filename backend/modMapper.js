@@ -1,7 +1,7 @@
 const axios = require("axios");
 
 const TRADE_STATS_URL = "https://www.pathofexile.com/api/trade/data/stats";
-const TRADE_STATS_REFRESH_MS = 1000 * 60 * 60 * 6; // 6 hours
+const TRADE_STATS_REFRESH_MS = 1000 * 60 * 60 * 6;
 
 const TRADE_ID_RE =
   /^(explicit|implicit|enchant|fractured|crafted|pseudo|rune|monster|veiled|delve)\.(stat|pseudo)_[A-Za-z0-9_]+$/;
@@ -45,11 +45,15 @@ function isValidTradeStatId(id) {
 function extractEntryTexts(entry) {
   const texts = [];
 
-  if (typeof entry?.text === "string") texts.push(entry.text);
+  if (typeof entry?.text === "string") {
+    texts.push(entry.text);
+  }
 
   if (Array.isArray(entry?.option?.options)) {
     for (const opt of entry.option.options) {
-      if (typeof opt?.text === "string") texts.push(opt.text);
+      if (typeof opt?.text === "string") {
+        texts.push(opt.text);
+      }
     }
   }
 
@@ -89,7 +93,7 @@ async function refreshTradeStats() {
     timeout: 15000,
     headers: {
       "User-Agent": "poe-trade-app/1.0",
-      "Accept": "application/json"
+      Accept: "application/json"
     },
     validateStatus: () => true
   });
@@ -215,7 +219,6 @@ function findBestTradeStat(text) {
   }
 
   if (!best) return null;
-
   if (best.score < 0.55) return null;
   if (!isValidTradeStatId(best.id)) return null;
 
@@ -287,6 +290,10 @@ function selectBestFilters(matches) {
 /* ---------------- MAIN ---------------- */
 
 function mapModsToTradeFilters(mods) {
+  const modTexts = (mods || [])
+    .map((m) => (typeof m === "string" ? m : m?.text || m?.name || ""))
+    .filter(Boolean);
+
   if (!state.initialized || !state.entries.length) {
     return {
       useStrict: false,
@@ -294,9 +301,7 @@ function mapModsToTradeFilters(mods) {
       debug: {
         allMatches: [],
         selected: [],
-        unmatched: (mods || []).map((m) =>
-          typeof m === "string" ? m : m?.text || m?.name || ""
-        ).filter(Boolean),
+        unmatched: modTexts,
         tradeStatsReady: false
       }
     };
