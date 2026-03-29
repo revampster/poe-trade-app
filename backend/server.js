@@ -86,25 +86,123 @@ function maybeDecodePoB(data) {
 
   const trimmed = data.trim();
 
-  // Already XML
   if (trimmed.startsWith("<")) {
     return trimmed;
   }
 
-  // Likely base64-compressed PoB code
   try {
     const compressed = Buffer.from(trimmed, "base64");
 
-    // Try inflateRaw first
     try {
       return zlib.inflateRawSync(compressed).toString("utf8");
     } catch {
-      // Then try inflate
       return zlib.inflateSync(compressed).toString("utf8");
     }
-  } catch (err) {
+  } catch {
     throw new Error("Fetched build was not XML and could not be decoded as a PoB code.");
   }
+}
+
+function extractItemText(item) {
+  if (typeof item?._ === "string") {
+    return item._;
+  }
+
+  if (Array.isArray(item) && typeof item[0] === "string") {
+    return item[0];
+  }
+
+  return "";
+}
+
+function parseModsFromItemText(itemText) {
+  if (!itemText) return [];
+
+  const lines = itemText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const mods = [];
+  let reachedMods = false;
+
+  for (const line of lines) {
+    if (
+      line.startsWith("Requirements:") ||
+      line.startsWith("Sockets:") ||
+      line.startsWith("LevelReq:") ||
+      line.startsWith("Implicits:") ||
+      line.startsWith("Quality:") ||
+      line.startsWith("Item Level:") ||
+      line.startsWith("Level:") ||
+      line.startsWith("Radius:") ||
+      line.startsWith("Limited to:")
+    ) {
+      continue;
+    }
+
+    if (
+      line.includes("Rarity:") ||
+      line === "Corrupted" ||
+      line === "Unidentified" ||
+      line.startsWith("Note:")
+    ) {
+      continue;
+    }
+
+    if (line.startsWith("{") && line.endsWith("}")) {
+      continue;
+    }
+
+    if (
+      line.includes("+") ||
+      line.includes("%") ||
+      line.includes("Minions") ||
+      line.includes("Trigger") ||
+      line.includes("Adds ") ||
+      line.includes("Gain ") ||
+      line.includes("Recover ") ||
+      line.includes("increased ") ||
+      line.includes("reduced ") ||
+      line.includes("more ") ||
+      line.includes("less ")
+    ) {
+      reachedMods = true;
+    }
+
+    if (!reachedMods) continue;
+
+    mods.push({
+      name: line,
+      tier: null
+    });
+  }
+
+  return mods;
+}
+
+function extractItemName(item, fallbackIndex) {
+  if (item?.$?.Name) return item.$.Name;
+  if (item?.$?.name) return item.$.name;
+
+  const text = extractItemText(item);
+  if (!text) return `Item ${fallbackIndex + 1}`;
+
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines[0]?.startsWith("Rarity:")) {
+    if (lines[1] && lines[2]) {
+      return `${lines[1]} ${lines[2]}`;
+    }
+    if (lines[1]) {
+      return lines[1];
+    }
+  }
+
+  return lines[0] || `Item ${fallbackIndex + 1}`;
 }
 
 function normalizeItemsFromXml(result) {
@@ -117,20 +215,12 @@ function normalizeItemsFromXml(result) {
   }
 
   return itemsNode.map((item, index) => {
-    const itemName =
-      item?.$?.Name ||
-      item?.$?.name ||
-      `Item ${index + 1}`;
-
-    const mods =
-      (item?.Mods?.[0]?.Mod || []).map((m) => ({
-        name: m?.$?.Name || m?.$?.name || "",
-        tier: m?.$?.Tier || m?.$?.tier || null
-      }))
-      .filter((m) => m.name);
+    const itemText = extractItemText(item);
+    const name = extractItemName(item, index);
+    const mods = parseModsFromItemText(itemText);
 
     return {
-      name: itemName,
+      name,
       mods
     };
   });
@@ -210,6 +300,15 @@ app.post("/generate", async (req, res) => {
     }
 
     const items = await parsePoB(input);
+
+    console.log("Parsed items preview:");
+    for (const item of items.slice(0, 5)) {
+      console.log({
+        name: item.name,
+        modCount: item.mods.length,
+        mods: item.mods.slice(0, 5)
+      });
+    }
 
     const results = items.map((item) => {
       const built = buildTradeQuery(item);
