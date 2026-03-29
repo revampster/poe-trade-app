@@ -9,6 +9,11 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const DEFAULT_TRADE_LEAGUE = process.env.TRADE_LEAGUE || "Mirage";
 
+const MAX_ITEMS_TO_PROCESS = 8;
+const MAX_MODS_PER_ITEM = 12;
+const MAX_BUILD_QUERY_MS = 4000;
+const MAX_PRICE_CHECKS = 3;
+
 app.use(cors());
 app.use(express.json());
 
@@ -38,7 +43,8 @@ async function fetchPoBData(input) {
     const id = input.trim().split("/").pop();
     const res = await axios.get(`https://pastebin.com/raw/${id}`, {
       validateStatus: () => true,
-      headers: { "User-Agent": "poe-trade-app/1.0" }
+      headers: { "User-Agent": "poe-trade-app/1.0" },
+      timeout: 10000
     });
 
     if (res.status !== 200) {
@@ -52,7 +58,8 @@ async function fetchPoBData(input) {
     const id = extractPobbId(input);
     const res = await axios.get(`https://pobb.in/${id}/raw`, {
       validateStatus: () => true,
-      headers: { "User-Agent": "poe-trade-app/1.0" }
+      headers: { "User-Agent": "poe-trade-app/1.0" },
+      timeout: 10000
     });
 
     if (res.status !== 200) {
@@ -379,6 +386,8 @@ function uniqueApproximationQuery(item) {
 }
 
 function buildTradeQuery(item) {
+  const started = Date.now();
+
   const explicitFilters = [];
   const implicitFilters = [];
   const enchantFilters = [];
@@ -389,7 +398,12 @@ function buildTradeQuery(item) {
 
   const looksUnique = /^[A-Z][\w' -]+ [A-Z][\w' -]+$/.test(item.name);
 
-  for (const mod of item.mods) {
+  for (const mod of item.mods.slice(0, MAX_MODS_PER_ITEM)) {
+    if (Date.now() - started > MAX_BUILD_QUERY_MS) {
+      console.warn("buildTradeQuery timeout", { item: item.name });
+      break;
+    }
+
     const found = findModByText(mod.name);
 
     if (!found) {
@@ -476,7 +490,8 @@ async function estimatePrice(tradeQuery, league) {
     const searchUrl = `https://www.pathofexile.com/api/trade/search/${encodeURIComponent(sanitizeLeagueName(league))}`;
     const searchRes = await axios.post(searchUrl, tradeQuery.query, {
       headers: POE_HEADERS,
-      validateStatus: () => true
+      validateStatus: () => true,
+      timeout: 8000
     });
 
     if (searchRes.status !== 200 || !searchRes.data?.id || !Array.isArray(searchRes.data?.result)) {
@@ -494,7 +509,8 @@ async function estimatePrice(tradeQuery, league) {
 
     const fetchRes = await axios.get(fetchUrl, {
       headers: POE_HEADERS,
-      validateStatus: () => true
+      validateStatus: () => true,
+      timeout: 8000
     });
 
     if (fetchRes.status !== 200 || !Array.isArray(fetchRes.data?.result)) {
@@ -529,19 +545,53 @@ async function estimatePrice(tradeQuery, league) {
 }
 
 app.post("/generate", async (req, res) => {
+  const started = Date.now();
+
   try {
     const { input, league, estimatePrices = false } = req.body;
+
+    console.log("START /generate", {
+      estimatePrices,
+      league,
+      hasInput: !!input
+    });
 
     if (!input || !input.trim()) {
       return res.status(400).json({ error: "No PoB input provided." });
     }
 
     const selectedLeague = sanitizeLeagueName(league);
-    const items = await parsePoB(input);
+    console.log("League selected:", selectedLeague, "elapsed", Date.now() - started, "ms");
+
+    const parsedItems = await parsePoB(input);
+    console.log("parsePoB done", {
+      itemCount: parsedItems.length,
+      elapsed: Date.now() - started
+    });
+
+    const items = parsedItems
+      .slice(0, MAX_ITEMS_TO_PROCESS)
+      .map((item) => ({
+        ...item,
+        mods: item.mods.slice(0, MAX_MODS_PER_ITEM)
+      }));
+
+    console.log("processing limited items", {
+      itemCount: items.length,
+      maxModsPerItem: MAX_MODS_PER_ITEM
+    });
 
     const builtResults = [];
     for (const item of items) {
+      const t0 = Date.now();
       const built = buildTradeQuery(item);
+
+      console.log("buildTradeQuery done", {
+        item: item.name,
+        matchedMods: built.matchedMods,
+        totalMods: built.totalMods,
+        ms: Date.now() - t0
+      });
 
       builtResults.push({
         item: item.name,
@@ -550,36 +600,53 @@ app.post("/generate", async (req, res) => {
     }
 
     const usableResults = builtResults.filter((r) => r.built.matchedMods > 0);
+    console.log("usableResults", {
+      count: usableResults.length,
+      elapsed: Date.now() - started
+    });
 
-    const finalResults = [];
-    for (const entry of usableResults) {
-      const priceEstimate = estimatePrices
-        ? await estimatePrice(entry.built.query, selectedLeague)
-        : null;
+    const finalResults = await Promise.all(
+      usableResults.map(async (entry, index) => {
+        let priceEstimate = null;
 
-      finalResults.push({
-        item: entry.item,
-        link: generateTradeLink(entry.built.query, selectedLeague),
-        matchedMods: entry.built.matchedMods,
-        totalMods: entry.built.totalMods,
-        upgradeScore:
-          entry.built.totalMods > 0
-            ? Math.round((entry.built.matchedMods / entry.built.totalMods) * 100)
-            : 0,
-        matchedDetails: entry.built.matchedDetails,
-        unmatchedMods: entry.built.unmatchedMods,
-        priceEstimate
-      });
-    }
+        if (estimatePrices && index < MAX_PRICE_CHECKS) {
+          const p0 = Date.now();
+          priceEstimate = await estimatePrice(entry.built.query, selectedLeague);
+          console.log("estimatePrice done", {
+            item: entry.item,
+            ms: Date.now() - p0
+          });
+        }
+
+        return {
+          item: entry.item,
+          link: generateTradeLink(entry.built.query, selectedLeague),
+          matchedMods: entry.built.matchedMods,
+          totalMods: entry.built.totalMods,
+          upgradeScore:
+            entry.built.totalMods > 0
+              ? Math.round((entry.built.matchedMods / entry.built.totalMods) * 100)
+              : 0,
+          matchedDetails: entry.built.matchedDetails,
+          unmatchedMods: entry.built.unmatchedMods,
+          priceEstimate
+        };
+      })
+    );
 
     finalResults.sort((a, b) => b.upgradeScore - a.upgradeScore);
+
+    console.log("END /generate", {
+      totalMs: Date.now() - started,
+      finalCount: finalResults.length
+    });
 
     return res.json({
       league: selectedLeague,
       results: finalResults
     });
   } catch (err) {
-    console.error("Generate Error:", err.message);
+    console.error("Generate Error:", err);
     return res.status(500).json({
       error: err.message || "Failed to generate trade links."
     });
