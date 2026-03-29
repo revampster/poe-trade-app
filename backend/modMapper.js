@@ -1,120 +1,95 @@
 const modsData = require("./data/mods.json");
 const statTranslations = require("./data/stat_translations.json");
 
-function stripTags(text) {
+function normalize(text) {
   return String(text || "")
-    .replace(/\{[^}]*\}/g, "")
-    .replace(/\([^)]*\)/g, "")
-    .trim();
-}
-
-function normalizeText(text) {
-  return stripTags(text)
     .toLowerCase()
+    .replace(/\{[^}]*\}/g, "")
     .replace(/\d+/g, "#")
     .replace(/[+%]/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }
 
-function collectTranslationStrings(statId) {
-  const out = [];
+/**
+ * 🔥 PREBUILD INDEX (runs once on startup)
+ */
+const MOD_INDEX = {};
 
-  for (const entry of Object.values(statTranslations)) {
-    if (!entry?.ids || !entry?.English) continue;
-    if (!entry.ids.includes(statId)) continue;
-
-    for (const block of entry.English) {
-      if (!block?.string) continue;
-      for (const s of block.string) {
-        out.push(stripTags(s));
-      }
-    }
-  }
-
-  return out;
-}
-
-function score(a, b) {
-  if (!a || !b) return 0;
-  if (a === b) return 100;
-  if (a.includes(b) || b.includes(a)) return 60;
-
-  const aWords = new Set(a.split(" "));
-  const bWords = new Set(b.split(" "));
-  let overlap = 0;
-
-  for (const w of aWords) {
-    if (bWords.has(w)) overlap++;
-  }
-
-  return overlap;
-}
-
-function isBad(text) {
-  const t = normalizeText(text);
-  return (
-    !t ||
-    t.length < 3 ||
-    t.includes("passive skills") ||
-    t.includes("afflictionjewel") ||
-    t.includes("allocates")
-  );
-}
-
-function findModByText(text) {
-  const needle = normalizeText(text);
-  if (isBad(needle)) return null;
-
-  let best = null;
-  let bestScore = 0;
-  let bestIndex = 0;
-
+function buildIndex() {
   for (const mod of Object.values(modsData)) {
     if (!mod?.stats) continue;
 
-    for (let i = 0; i < mod.stats.length; i++) {
-      const stat = mod.stats[i];
+    for (const stat of mod.stats) {
       if (!stat?.id) continue;
 
-      const candidates = [stat.id, ...collectTranslationStrings(stat.id)];
+      // index stat id
+      const normId = normalize(stat.id);
+      if (!MOD_INDEX[normId]) {
+        MOD_INDEX[normId] = { mod, stat };
+      }
 
-      for (const c of candidates) {
-        const norm = normalizeText(c);
-        if (isBad(norm)) continue;
+      // index translation strings
+      for (const entry of Object.values(statTranslations)) {
+        if (!entry?.ids?.includes(stat.id)) continue;
 
-        const s = score(needle, norm);
-
-        if (s > bestScore) {
-          bestScore = s;
-          best = mod;
-          bestIndex = i;
+        for (const block of entry.English || []) {
+          for (const str of block.string || []) {
+            const norm = normalize(str);
+            if (!MOD_INDEX[norm]) {
+              MOD_INDEX[norm] = { mod, stat };
+            }
+          }
         }
       }
     }
   }
 
-  if (bestScore < 2) return null;
+  console.log("Mod index built:", Object.keys(MOD_INDEX).length);
+}
 
-  return {
-    mod: best,
-    statIndex: bestIndex,
-    score: bestScore
-  };
+buildIndex();
+
+/**
+ * ⚡ FAST LOOKUP
+ */
+function findModByText(text) {
+  const key = normalize(text);
+
+  if (MOD_INDEX[key]) {
+    return {
+      mod: MOD_INDEX[key].mod,
+      statIndex: 0,
+      score: 100
+    };
+  }
+
+  // fallback (light fuzzy, NOT full scan)
+  const keys = Object.keys(MOD_INDEX);
+
+  for (const k of keys) {
+    if (k.includes(key) || key.includes(k)) {
+      return {
+        mod: MOD_INDEX[k].mod,
+        statIndex: 0,
+        score: 60
+      };
+    }
+  }
+
+  return null;
 }
 
 function getTierRange(found, tierIndex = 0) {
   if (!found?.mod?.stats) return null;
 
-  const stat = found.mod.stats[found.statIndex];
+  const stat = found.mod.stats[0];
   if (!stat?.min || !stat?.max) return null;
-
-  const i = Math.max(0, Math.min(tierIndex, stat.min.length - 1));
 
   return {
     statId: stat.id,
-    min: stat.min[i],
-    max: stat.max[i]
+    min: stat.min[0],
+    max: stat.max[0]
   };
 }
 
