@@ -10,8 +10,8 @@ const PORT = process.env.PORT || 3001;
 const DEFAULT_TRADE_LEAGUE = process.env.TRADE_LEAGUE || "Mirage";
 
 const MAX_ITEMS_TO_PROCESS = 8;
-const MAX_MODS_PER_ITEM = 12;
-const MAX_BUILD_QUERY_MS = 4000;
+const MAX_MODS_PER_ITEM = 10;
+const MAX_BUILD_QUERY_MS = 2500;
 const MAX_PRICE_CHECKS = 3;
 
 app.use(cors());
@@ -375,7 +375,7 @@ function normalizeTierIndex(tier) {
   return Math.max(parseInt(match[1], 10) - 1, 0);
 }
 
-function uniqueApproximationQuery(item) {
+function buildNameOnlyQuery(item) {
   return {
     query: {
       status: { option: "online" },
@@ -385,7 +385,34 @@ function uniqueApproximationQuery(item) {
   };
 }
 
-function buildTradeQuery(item) {
+function isValidFilter(filter) {
+  return (
+    filter &&
+    typeof filter.id === "string" &&
+    filter.id.trim().length > 0 &&
+    filter.value &&
+    typeof filter.value.min === "number" &&
+    typeof filter.value.max === "number" &&
+    Number.isFinite(filter.value.min) &&
+    Number.isFinite(filter.value.max)
+  );
+}
+
+function dedupeFilters(filters) {
+  const seen = new Set();
+  const out = [];
+
+  for (const filter of filters) {
+    const key = `${filter.id}:${filter.value.min}:${filter.value.max}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(filter);
+  }
+
+  return out;
+}
+
+function buildSafeTradeQuery(item) {
   const started = Date.now();
 
   const explicitFilters = [];
@@ -395,8 +422,6 @@ function buildTradeQuery(item) {
   let matchedMods = 0;
   const matchedDetails = [];
   const unmatchedMods = [];
-
-  const looksUnique = /^[A-Z][\w' -]+ [A-Z][\w' -]+$/.test(item.name);
 
   for (const mod of item.mods.slice(0, MAX_MODS_PER_ITEM)) {
     if (Date.now() - started > MAX_BUILD_QUERY_MS) {
@@ -414,7 +439,7 @@ function buildTradeQuery(item) {
     const tierIndex = normalizeTierIndex(mod.tier);
     const range = getTierRange(found, tierIndex);
 
-    if (!range || !range.statId) {
+    if (!range || typeof range.statId !== "string" || !range.statId.trim()) {
       unmatchedMods.push(mod.name);
       continue;
     }
@@ -422,10 +447,15 @@ function buildTradeQuery(item) {
     const filter = {
       id: range.statId,
       value: {
-        min: range.min,
-        max: range.max
+        min: Number(range.min),
+        max: Number(range.max)
       }
     };
+
+    if (!isValidFilter(filter)) {
+      unmatchedMods.push(mod.name);
+      continue;
+    }
 
     if (mod.kind === "implicit") {
       implicitFilters.push(filter);
@@ -440,37 +470,40 @@ function buildTradeQuery(item) {
       inputMod: mod.name,
       kind: mod.kind || "explicit",
       statId: range.statId,
-      min: range.min,
-      max: range.max,
+      min: Number(range.min),
+      max: Number(range.max),
       score: found.score
     });
   }
 
-  const stats = [];
-  if (explicitFilters.length) stats.push({ type: "and", filters: explicitFilters });
-  if (implicitFilters.length) stats.push({ type: "and", filters: implicitFilters });
-  if (enchantFilters.length) stats.push({ type: "and", filters: enchantFilters });
+  const allFilters = dedupeFilters([
+    ...explicitFilters,
+    ...implicitFilters,
+    ...enchantFilters
+  ]).filter(isValidFilter);
 
-  const query = looksUnique
-    ? uniqueApproximationQuery(item)
-    : {
-        query: {
-          status: { option: "online" },
-          name: item.name,
-          stats
-        }
-      };
+  const stats = allFilters.length
+    ? [{ type: "and", filters: allFilters }]
+    : [];
 
-  if (!looksUnique && stats.length === 0) {
-    query.query.stats = [];
-  }
+  const strictQuery = {
+    query: {
+      status: { option: "online" },
+      name: item.name,
+      stats
+    }
+  };
+
+  const fallbackQuery = buildNameOnlyQuery(item);
 
   return {
     matchedMods,
     totalMods: item.mods.length,
     matchedDetails,
     unmatchedMods,
-    query
+    strictQuery,
+    fallbackQuery,
+    useStrict: allFilters.length > 0
   };
 }
 
@@ -584,13 +617,14 @@ app.post("/generate", async (req, res) => {
     const builtResults = [];
     for (const item of items) {
       const t0 = Date.now();
-      const built = buildTradeQuery(item);
+      const built = buildSafeTradeQuery(item);
 
       console.log("buildTradeQuery done", {
         item: item.name,
         matchedMods: built.matchedMods,
         totalMods: built.totalMods,
-        ms: Date.now() - t0
+        ms: Date.now() - t0,
+        useStrict: built.useStrict
       });
 
       builtResults.push({
@@ -599,19 +633,20 @@ app.post("/generate", async (req, res) => {
       });
     }
 
-    const usableResults = builtResults.filter((r) => r.built.matchedMods > 0);
-    console.log("usableResults", {
-      count: usableResults.length,
-      elapsed: Date.now() - started
-    });
+    const usableResults = builtResults.filter(
+      (r) => r.built.useStrict || r.item
+    );
 
     const finalResults = await Promise.all(
       usableResults.map(async (entry, index) => {
-        let priceEstimate = null;
+        const chosenQuery = entry.built.useStrict
+          ? entry.built.strictQuery
+          : entry.built.fallbackQuery;
 
+        let priceEstimate = null;
         if (estimatePrices && index < MAX_PRICE_CHECKS) {
           const p0 = Date.now();
-          priceEstimate = await estimatePrice(entry.built.query, selectedLeague);
+          priceEstimate = await estimatePrice(chosenQuery, selectedLeague);
           console.log("estimatePrice done", {
             item: entry.item,
             ms: Date.now() - p0
@@ -620,7 +655,7 @@ app.post("/generate", async (req, res) => {
 
         return {
           item: entry.item,
-          link: generateTradeLink(entry.built.query, selectedLeague),
+          link: generateTradeLink(chosenQuery, selectedLeague),
           matchedMods: entry.built.matchedMods,
           totalMods: entry.built.totalMods,
           upgradeScore:
@@ -629,12 +664,18 @@ app.post("/generate", async (req, res) => {
               : 0,
           matchedDetails: entry.built.matchedDetails,
           unmatchedMods: entry.built.unmatchedMods,
+          queryMode: entry.built.useStrict ? "strict" : "fallback",
           priceEstimate
         };
       })
     );
 
-    finalResults.sort((a, b) => b.upgradeScore - a.upgradeScore);
+    finalResults.sort((a, b) => {
+      if (b.upgradeScore !== a.upgradeScore) {
+        return b.upgradeScore - a.upgradeScore;
+      }
+      return a.queryMode.localeCompare(b.queryMode);
+    });
 
     console.log("END /generate", {
       totalMs: Date.now() - started,
