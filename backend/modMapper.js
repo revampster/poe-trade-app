@@ -14,8 +14,6 @@ const state = {
   entries: []
 };
 
-/* ---------------- NORMALIZE ---------------- */
-
 function normalize(text) {
   return String(text || "")
     .toLowerCase()
@@ -39,8 +37,6 @@ function uniq(arr) {
 function isValidTradeStatId(id) {
   return TRADE_ID_RE.test(String(id || ""));
 }
-
-/* ---------------- TRADE STATS LOADING ---------------- */
 
 function extractEntryTexts(entry) {
   const texts = [];
@@ -149,8 +145,6 @@ function getTradeStatsStatus() {
   };
 }
 
-/* ---------------- MATCHING ---------------- */
-
 function score(a, b) {
   if (!a || !b) return 0;
   if (a === b) return 100;
@@ -219,13 +213,11 @@ function findBestTradeStat(text) {
   }
 
   if (!best) return null;
-  if (best.score < 0.55) return null;
+  if (best.score < 0.6) return null;
   if (!isValidTradeStatId(best.id)) return null;
 
   return best;
 }
-
-/* ---------------- FILTER SELECTION ---------------- */
 
 function dedupeMatches(matches) {
   const seen = new Set();
@@ -242,8 +234,8 @@ function dedupeMatches(matches) {
 
 function selectBestFilters(matches) {
   const caps = {
-    total: 4,
-    explicit: 3,
+    total: 3,
+    explicit: 2,
     implicit: 1,
     enchant: 1
   };
@@ -286,8 +278,6 @@ function selectBestFilters(matches) {
 
   return selected.slice(0, caps.total);
 }
-
-/* ---------------- MAIN ---------------- */
 
 function mapModsToTradeFilters(mods) {
   const modTexts = (mods || [])

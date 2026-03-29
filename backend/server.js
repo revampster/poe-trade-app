@@ -17,17 +17,26 @@ const DEFAULT_TRADE_LEAGUE = process.env.TRADE_LEAGUE || "Mirage";
 
 const MAX_ITEMS_TO_PROCESS = 8;
 const MAX_MODS_PER_ITEM = 10;
-const SEARCH_DELAY_MS = 350;
+const SEARCH_DELAY_MS = 300;
 const MAX_SEARCH_RETRIES = 2;
+const ENABLE_DEBUG = true;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
 const POE_HEADERS = {
   "User-Agent": "poe-trade-app/1.0",
   "Content-Type": "application/json",
   Accept: "application/json"
 };
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function safeJsonClone(obj) {
+  return JSON.parse(JSON.stringify(obj));
+}
 
 app.get("/", (req, res) => {
   res.json({
@@ -37,10 +46,6 @@ app.get("/", (req, res) => {
     tradeStats: getTradeStatsStatus()
   });
 });
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function sanitizeLeagueName(league) {
   const cleaned = String(league || "").trim();
@@ -114,14 +119,8 @@ function maybeDecodePoB(data) {
 }
 
 function extractItemText(item) {
-  if (typeof item?._ === "string") {
-    return item._;
-  }
-
-  if (Array.isArray(item) && typeof item[0] === "string") {
-    return item[0];
-  }
-
+  if (typeof item?._ === "string") return item._;
+  if (Array.isArray(item) && typeof item[0] === "string") return item[0];
   return "";
 }
 
@@ -190,6 +189,11 @@ function shouldSkipModLine(line) {
 
   return (
     lower.includes("adds # passive skills") ||
+    lower.includes("adds 8 passive skills") ||
+    lower.includes("adds 9 passive skills") ||
+    lower.includes("adds 10 passive skills") ||
+    lower.includes("adds 11 passive skills") ||
+    lower.includes("adds 12 passive skills") ||
     lower.includes("passive skills are jewel sockets") ||
     lower.includes("allocates ") ||
     lower.includes("selection:") ||
@@ -245,6 +249,16 @@ function classifyMod(line) {
     text: noTags,
     kind: "explicit"
   };
+}
+
+function detectClusterBaseType(lines) {
+  const joined = lines.join("\n").toLowerCase();
+
+  if (joined.includes("large cluster jewel")) return "Large Cluster Jewel";
+  if (joined.includes("medium cluster jewel")) return "Medium Cluster Jewel";
+  if (joined.includes("small cluster jewel")) return "Small Cluster Jewel";
+
+  return "";
 }
 
 function parseModsFromItemText(itemText) {
@@ -340,7 +354,8 @@ function extractItemMeta(item, fallbackIndex) {
       rarity: "Unknown",
       displayName: `Item ${fallbackIndex + 1}`,
       searchName: "",
-      searchType: ""
+      searchType: "",
+      rawLines: []
     };
   }
 
@@ -365,14 +380,14 @@ function extractItemMeta(item, fallbackIndex) {
     searchType = lines[2] || "";
     displayName = [rareName, searchType].filter(Boolean).join(" ") || rareName || searchType || displayName;
   } else if (rarity === "Magic") {
-    // Magic items may have either:
-    // lines[1] = full magic name
-    // lines[2] = base type
-    // If base type exists, prefer it for trade type.
+    const clusterType = detectClusterBaseType(lines);
     const magicName = lines[1] || "";
     const maybeBase = lines[2] || "";
 
-    if (maybeBase) {
+    if (clusterType) {
+      searchType = clusterType;
+      displayName = [magicName, clusterType].filter(Boolean).join(" ");
+    } else if (maybeBase) {
       searchType = maybeBase;
       displayName = [magicName, maybeBase].filter(Boolean).join(" ");
     } else {
@@ -388,7 +403,8 @@ function extractItemMeta(item, fallbackIndex) {
     rarity,
     displayName,
     searchName,
-    searchType
+    searchType,
+    rawLines: lines
   };
 }
 
@@ -411,6 +427,7 @@ function normalizeItemsFromXml(result) {
       displayName: meta.displayName,
       searchName: meta.searchName,
       searchType: meta.searchType,
+      rawLines: meta.rawLines,
       mods
     };
   });
@@ -429,52 +446,89 @@ async function parsePoB(input) {
   return normalizeItemsFromXml(result);
 }
 
-function buildEmptyStatsGroup() {
+function buildStatsGroup(filters = []) {
   return [
     {
       type: "and",
-      filters: []
+      filters
     }
   ];
 }
 
-function buildFallbackQuery(item) {
+function buildBaseQuery(item, variant = "default") {
   const query = {
     query: {
       status: { option: "online" },
-      stats: buildEmptyStatsGroup()
+      stats: buildStatsGroup([])
     },
     sort: { price: "asc" }
   };
 
-  if (item.rarity === "Unique" && item.searchName) {
-    query.query.name = item.searchName;
-    if (item.searchType) query.query.type = item.searchType;
-  } else if (item.searchType) {
-    query.query.type = item.searchType;
+  const type = String(item.searchType || "").trim();
+  const name = String(item.searchName || "").trim();
+
+  if (variant === "status-only") {
+    return query;
+  }
+
+  if (item.rarity === "Unique") {
+    if (variant === "unique-name-type") {
+      if (name) query.query.name = name;
+      if (type) query.query.type = type;
+      return query;
+    }
+
+    if (variant === "type-only" && type) {
+      query.query.type = type;
+      return query;
+    }
+
+    if (variant === "name-only" && name) {
+      query.query.name = name;
+      return query;
+    }
+  } else {
+    if (variant === "type-only" && type) {
+      query.query.type = type;
+      return query;
+    }
+
+    if (variant === "name-only" && name) {
+      query.query.name = name;
+      return query;
+    }
+  }
+
+  if (type) {
+    query.query.type = type;
+  } else if (name) {
+    query.query.name = name;
   }
 
   return query;
 }
 
-function buildStrictCandidateQuery(item) {
-  const mapped = mapModsToTradeFilters(item.mods.slice(0, MAX_MODS_PER_ITEM));
-  const validStrictFilters = mapped.filters.filter((f) => isValidTradeStatId(f.id));
+function getBaseQueryCandidates(item) {
+  const candidates = [];
 
-  const strictQuery = buildFallbackQuery(item);
-  strictQuery.query.stats = buildTradeStats(validStrictFilters);
+  if (item.rarity === "Unique") {
+    candidates.push({ label: "base-unique-name-type", query: buildBaseQuery(item, "unique-name-type") });
+    candidates.push({ label: "base-unique-type-only", query: buildBaseQuery(item, "type-only") });
+    candidates.push({ label: "base-unique-name-only", query: buildBaseQuery(item, "name-only") });
+  } else {
+    candidates.push({ label: "base-type-only", query: buildBaseQuery(item, "type-only") });
+    candidates.push({ label: "base-name-only", query: buildBaseQuery(item, "name-only") });
+  }
 
-  return {
-    query: strictQuery,
-    matchedFilters: validStrictFilters,
-    matchedDetails: mapped.debug.selected.filter((m) => isValidTradeStatId(m.id)),
-    allMatchedMods: mapped.debug.allMatches,
-    unmatchedMods: mapped.debug.unmatched,
-    matchedMods: mapped.debug.selected.length,
-    totalMods: item.mods.length,
-    tradeStatsReady: mapped.debug.tradeStatsReady,
-    canTryStrict: validStrictFilters.length > 0
-  };
+  candidates.push({ label: "base-status-only", query: buildBaseQuery(item, "status-only") });
+
+  const seen = new Set();
+  return candidates.filter((c) => {
+    const key = JSON.stringify(c.query);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 async function submitTradeSearch(queryObject, league) {
@@ -483,11 +537,11 @@ async function submitTradeSearch(queryObject, league) {
   )}`;
 
   let attempt = 0;
-  let lastRes = null;
+  let last = null;
 
   while (attempt <= MAX_SEARCH_RETRIES) {
     if (attempt > 0) {
-      await sleep(600 * attempt);
+      await sleep(700 * attempt);
     }
 
     const res = await axios.post(searchUrl, queryObject, {
@@ -496,12 +550,15 @@ async function submitTradeSearch(queryObject, league) {
       timeout: 12000
     });
 
-    lastRes = res;
+    last = res;
 
     if (res.status !== 429) {
       return {
         status: res.status,
-        data: res.data
+        data: res.data,
+        headers: {
+          "retry-after": res.headers["retry-after"] || null
+        }
       };
     }
 
@@ -509,15 +566,18 @@ async function submitTradeSearch(queryObject, league) {
     if (Number.isFinite(retryAfter) && retryAfter > 0) {
       await sleep(retryAfter * 1000);
     } else {
-      await sleep(1200 * (attempt + 1));
+      await sleep(1500 * (attempt + 1));
     }
 
     attempt += 1;
   }
 
   return {
-    status: lastRes?.status || 429,
-    data: lastRes?.data || null
+    status: last?.status || 429,
+    data: last?.data || null,
+    headers: {
+      "retry-after": last?.headers?.["retry-after"] || null
+    }
   };
 }
 
@@ -526,81 +586,177 @@ function buildTradeResultLink(league, searchId) {
   return `https://www.pathofexile.com/trade/search/${finalLeague}/${encodeURIComponent(searchId)}`;
 }
 
+function sanitizeDebugResponse(data) {
+  if (data == null) return null;
+  if (typeof data === "string") return data.slice(0, 600);
+  try {
+    return JSON.parse(JSON.stringify(data)).error
+      ? { error: data.error }
+      : JSON.parse(JSON.stringify(data));
+  } catch {
+    return { note: "unserializable response" };
+  }
+}
+
+async function tryQuery(label, query, league, debugAttempts) {
+  const result = await submitTradeSearch(query, league);
+
+  debugAttempts.push({
+    label,
+    status: result.status,
+    searchId: result?.data?.id || null,
+    query: safeJsonClone(query),
+    response: sanitizeDebugResponse(result.data)
+  });
+
+  return result;
+}
+
 async function resolveTradeQuery(item, league) {
-  const fallbackQuery = buildFallbackQuery(item);
-  const strictCandidate = buildStrictCandidateQuery(item);
+  const debugAttempts = [];
+  const mapped = mapModsToTradeFilters(item.mods.slice(0, MAX_MODS_PER_ITEM));
+  const strictCandidates = mapped.filters.filter((f) => isValidTradeStatId(f.id));
 
-  let strictAttempt = null;
-  let fallbackAttempt = null;
+  const matchedDetails = mapped.debug.selected.filter((m) => isValidTradeStatId(m.id));
 
-  if (strictCandidate.canTryStrict) {
-    strictAttempt = await submitTradeSearch(strictCandidate.query, league);
-    const strictId = strictAttempt?.data?.id;
+  let acceptedBase = null;
+  let acceptedBaseLabel = null;
 
-    if (strictAttempt.status === 200 && strictId) {
-      return {
-        chosenQuery: strictCandidate.query,
-        queryMode: "strict",
-        link: buildTradeResultLink(league, strictId),
-        searchId: strictId,
-        strictAccepted: true,
-        fallbackAccepted: false,
-        matchedMods: strictCandidate.matchedMods,
-        totalMods: strictCandidate.totalMods,
-        matchedFilters: strictCandidate.matchedFilters,
-        matchedDetails: strictCandidate.matchedDetails,
-        allMatchedMods: strictCandidate.allMatchedMods,
-        unmatchedMods: strictCandidate.unmatchedMods,
-        tradeStatsReady: strictCandidate.tradeStatsReady,
-        strictStatus: strictAttempt.status,
-        fallbackStatus: null
-      };
+  for (const candidate of getBaseQueryCandidates(item)) {
+    const result = await tryQuery(candidate.label, candidate.query, league, debugAttempts);
+    if (result.status === 200 && result?.data?.id) {
+      acceptedBase = candidate.query;
+      acceptedBaseLabel = candidate.label;
+      break;
     }
 
     await sleep(SEARCH_DELAY_MS);
   }
 
-  fallbackAttempt = await submitTradeSearch(fallbackQuery, league);
-  const fallbackId = fallbackAttempt?.data?.id;
-
-  if (fallbackAttempt.status === 200 && fallbackId) {
+  if (!acceptedBase) {
     return {
-      chosenQuery: fallbackQuery,
-      queryMode: "fallback",
-      link: buildTradeResultLink(league, fallbackId),
-      searchId: fallbackId,
+      link: null,
+      searchId: null,
+      queryMode: "failed",
       strictAccepted: false,
-      fallbackAccepted: true,
-      matchedMods: strictCandidate.matchedMods,
-      totalMods: strictCandidate.totalMods,
-      matchedFilters: strictCandidate.matchedFilters,
-      matchedDetails: strictCandidate.matchedDetails,
-      allMatchedMods: strictCandidate.allMatchedMods,
-      unmatchedMods: strictCandidate.unmatchedMods,
-      tradeStatsReady: strictCandidate.tradeStatsReady,
-      strictStatus: strictAttempt ? strictAttempt.status : null,
-      fallbackStatus: fallbackAttempt.status
+      fallbackAccepted: false,
+      matchedMods: mapped.debug.selected.length,
+      totalMods: item.mods.length,
+      matchedFilters: strictCandidates,
+      matchedDetails,
+      allMatchedMods: mapped.debug.allMatches,
+      unmatchedMods: mapped.debug.unmatched,
+      tradeStatsReady: mapped.debug.tradeStatsReady,
+      debug: {
+        itemMeta: {
+          rarity: item.rarity,
+          displayName: item.displayName,
+          searchName: item.searchName,
+          searchType: item.searchType
+        },
+        acceptedBaseLabel: null,
+        attempts: debugAttempts
+      }
     };
   }
 
+  let acceptedQuery = safeJsonClone(acceptedBase);
+  let acceptedSearchId = debugAttempts[debugAttempts.length - 1].searchId;
+  let queryMode = "fallback";
+
+  if (strictCandidates.length > 0) {
+    const acceptedFilters = [];
+
+    for (const filter of strictCandidates) {
+      const nextQuery = safeJsonClone(acceptedQuery);
+      nextQuery.query.stats = buildStatsGroup([
+        ...acceptedFilters,
+        { id: filter.id, disabled: false }
+      ]);
+
+      const result = await tryQuery(
+        `strict-add-${filter.id}`,
+        nextQuery,
+        league,
+        debugAttempts
+      );
+
+      if (result.status === 200 && result?.data?.id) {
+        acceptedFilters.push({ id: filter.id, disabled: false });
+        acceptedQuery = nextQuery;
+        acceptedSearchId = result.data.id;
+        queryMode = "strict";
+      }
+
+      await sleep(SEARCH_DELAY_MS);
+    }
+  }
+
   return {
-    chosenQuery: fallbackQuery,
-    queryMode: "failed",
-    link: null,
-    searchId: null,
-    strictAccepted: false,
-    fallbackAccepted: false,
-    matchedMods: strictCandidate.matchedMods,
-    totalMods: strictCandidate.totalMods,
-    matchedFilters: strictCandidate.matchedFilters,
-    matchedDetails: strictCandidate.matchedDetails,
-    allMatchedMods: strictCandidate.allMatchedMods,
-    unmatchedMods: strictCandidate.unmatchedMods,
-    tradeStatsReady: strictCandidate.tradeStatsReady,
-    strictStatus: strictAttempt ? strictAttempt.status : null,
-    fallbackStatus: fallbackAttempt ? fallbackAttempt.status : null
+    link: buildTradeResultLink(league, acceptedSearchId),
+    searchId: acceptedSearchId,
+    queryMode,
+    strictAccepted: queryMode === "strict",
+    fallbackAccepted: true,
+    matchedMods: mapped.debug.selected.length,
+    totalMods: item.mods.length,
+    matchedFilters:
+      queryMode === "strict"
+        ? (acceptedQuery.query.stats?.[0]?.filters || [])
+        : [],
+    matchedDetails,
+    allMatchedMods: mapped.debug.allMatches,
+    unmatchedMods: mapped.debug.unmatched,
+    tradeStatsReady: mapped.debug.tradeStatsReady,
+    tradeQuery: acceptedQuery,
+    debug: {
+      itemMeta: {
+        rarity: item.rarity,
+        displayName: item.displayName,
+        searchName: item.searchName,
+        searchType: item.searchType
+      },
+      acceptedBaseLabel,
+      attempts: debugAttempts
+    }
   };
 }
+
+app.post("/debug/validate-query", async (req, res) => {
+  try {
+    const { league, query } = req.body || {};
+    if (!query) {
+      return res.status(400).json({ error: "Missing query" });
+    }
+
+    const result = await submitTradeSearch(query, sanitizeLeagueName(league));
+    return res.json({
+      ok: result.status === 200 && !!result?.data?.id,
+      status: result.status,
+      searchId: result?.data?.id || null,
+      response: sanitizeDebugResponse(result.data),
+      query
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message || "debug validate failed" });
+  }
+});
+
+app.post("/debug/item-query", async (req, res) => {
+  try {
+    await initTradeStats();
+
+    const { item, league } = req.body || {};
+    if (!item) {
+      return res.status(400).json({ error: "Missing item" });
+    }
+
+    const resolved = await resolveTradeQuery(item, sanitizeLeagueName(league));
+    return res.json(resolved);
+  } catch (err) {
+    return res.status(500).json({ error: err.message || "debug item query failed" });
+  }
+});
 
 app.post("/generate", async (req, res) => {
   const started = Date.now();
@@ -621,8 +777,8 @@ app.post("/generate", async (req, res) => {
     }
 
     const selectedLeague = sanitizeLeagueName(league);
-
     const parsedItems = await parsePoB(input);
+
     console.log("parsePoB done", {
       itemCount: parsedItems.length,
       elapsed: Date.now() - started
@@ -640,7 +796,7 @@ app.post("/generate", async (req, res) => {
       maxModsPerItem: MAX_MODS_PER_ITEM
     });
 
-    const finalResults = [];
+    const results = [];
 
     for (const item of items) {
       const t0 = Date.now();
@@ -652,17 +808,14 @@ app.post("/generate", async (req, res) => {
         totalMods: resolved.totalMods,
         ms: Date.now() - t0,
         queryMode: resolved.queryMode,
-        strictStatus: resolved.strictStatus,
-        fallbackStatus: resolved.fallbackStatus,
-        matchedFilters: resolved.matchedDetails.map((m) => ({
-          mod: m.mod,
-          id: m.id,
-          score: m.score,
-          type: m.type
+        debugAttempts: resolved.debug.attempts.map((a) => ({
+          label: a.label,
+          status: a.status,
+          searchId: a.searchId
         }))
       });
 
-      finalResults.push({
+      results.push({
         item: item.displayName,
         rarity: item.rarity,
         searchName: item.searchName,
@@ -683,9 +836,8 @@ app.post("/generate", async (req, res) => {
         strictAccepted: resolved.strictAccepted,
         fallbackAccepted: resolved.fallbackAccepted,
         tradeStatsReady: resolved.tradeStatsReady,
-        strictStatus: resolved.strictStatus,
-        fallbackStatus: resolved.fallbackStatus,
-        tradeQuery: resolved.chosenQuery
+        tradeQuery: resolved.tradeQuery || null,
+        debug: ENABLE_DEBUG ? resolved.debug : undefined
       });
 
       await sleep(SEARCH_DELAY_MS);
@@ -693,13 +845,13 @@ app.post("/generate", async (req, res) => {
 
     console.log("END /generate", {
       totalMs: Date.now() - started,
-      finalCount: finalResults.length
+      finalCount: results.length
     });
 
     return res.json({
       league: selectedLeague,
       tradeStats: getTradeStatsStatus(),
-      results: finalResults
+      results
     });
   } catch (err) {
     console.error("Generate Error:", err);
